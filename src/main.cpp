@@ -1,0 +1,25 @@
+#include "Generator.h"
+#include "MeshingTree.h"
+#include <vector>
+double **points;
+size_t **faces;
+double *seeds_sizing, *seedes;
+size_t *seeds_region_id;
+std::vector<int> face_flat;
+int main()
+{
+    Generator generator;
+    MeshingTree *spheres = new MeshingTree();
+    MeshingTree *upper_seeds = new MeshingTree();
+    MeshingTree *lower_seeds = new MeshingTree();
+    MeshingTree *seeds = new MeshingTree();
+    size_t num_points, num_faces, num_faces1;
+    generator.read_input_obj_file("./data/obj/mobius1.obj",num_points,points,num_faces,faces);
+    generator.generate_spheres("./data/spheres/Sphere_2500_55.csv", spheres);
+    generator.read_obj_faces("./data/obj/Ours_2500_mobius1_Remesh.obj",face_flat, num_faces1);
+    generator.generate_surface_seeds(num_points, points, num_faces, faces,
+         spheres, upper_seeds, lower_seeds);
+    generator.color_surface_seeds(num_faces, spheres,upper_seeds, lower_seeds, seeds,
+        face_flat, seedes, seeds_region_id, seeds_sizing);
+    generator.generate_seed_csv("seeds.csv",3,seeds->get_num_tree_points(),seedes, seeds_sizing, seeds_region_id);
+}
