@@ -489,8 +489,15 @@ void Generator::generate_surface_seeds(size_t num_points, double **points, size_
 void Generator::color_surface_seeds(int num_faces, MeshingTree *surface_spheres,MeshingTree *upper_seeds, MeshingTree *lower_seeds,MeshingTree *seeds,
         std::vector<int> face, double* &seedes, size_t* &seeds_region_id, double* &seeds_sizing)
 {
+
+	size_t actual_num_faces = face.size() / 3;
+    std::cout << "[Debug] In color_surface_seeds:" << std::endl;
+    std::cout << "  - Face vector size: " << face.size() << " (implies " << actual_num_faces << " faces)" << std::endl;
+    
     size_t num_upper_seeds(upper_seeds->get_num_tree_points());
-	  size_t num_lower_seeds(lower_seeds->get_num_tree_points());
+    size_t num_lower_seeds(lower_seeds->get_num_tree_points());
+    std::cout << "  - Upper seeds: " << num_upper_seeds << ", Lower seeds: " << num_lower_seeds << std::endl;
+
     // adjust id of seed pair for upper seeds
     for (size_t iseed = 0; iseed < num_upper_seeds; iseed++)
     {
@@ -542,6 +549,18 @@ void Generator::color_surface_seeds(int num_faces, MeshingTree *surface_spheres,
 				face_set.insert(key);
 			}
 
+			int max_face_idx = -1;
+        for(int idx : face) {
+            if(idx > max_face_idx) max_face_idx = idx;
+        }
+        std::cout << "[Debug] Max Vertex Index in OBJ: " << max_face_idx << std::endl;
+        std::cout << "[Debug] Total Spheres (Seeds' source): " << surface_spheres->get_num_tree_points() << std::endl;
+        
+        if (max_face_idx >= surface_spheres->get_num_tree_points()) {
+            std::cout << "[ERROR] MISMATCH DETECTED: OBJ references vertices up to index " << max_face_idx 
+                      << ", but there are only " << surface_spheres->get_num_tree_points() << " spheres!" << std::endl;
+        }
+
 			for (size_t iseed = 0; iseed < num_seeds; iseed++)
 			{
 				if (!seeds->tree_point_is_active(iseed)) continue;
@@ -560,7 +579,8 @@ void Generator::color_surface_seeds(int num_faces, MeshingTree *surface_spheres,
 				}
 			}
 		}
-
+		
+		
 		for (size_t iseed = 0; iseed < num_seeds; iseed++)
 		{
 			// Establish Sphere -> Seeds directional graph
@@ -573,6 +593,7 @@ void Generator::color_surface_seeds(int num_faces, MeshingTree *surface_spheres,
 		double* face_normal = new double[3];
 		double** face_corners = new double*[3];
 		size_t num_spheres(surface_spheres->get_num_tree_points());
+		int cand = -1;
 		for (size_t isphere = 0; isphere < num_spheres; isphere++)
 		{
 			#pragma region Connect Seeds of Surface Spheres:
@@ -588,59 +609,63 @@ void Generator::color_surface_seeds(int num_faces, MeshingTree *surface_spheres,
 				size_t attrib_pair = 0;
 				seeds->get_tree_point_attrib(seed_i, 1, attrib_pair);
 				if (attrib_pair < num_seeds && seeds->tree_point_is_active(attrib_pair))
-					seeds->set_tree_point_attrib(seed_i, 5, static_cast<size_t>(0));
+				{
+					size_t* attrib = seeds->get_tree_point_attrib(seed_i);
+					attrib[5] = 0;
+				}
 			}
 
 			size_t first_neighbor(isphere), jsphere(isphere);
-			if (true)
+			
+			#pragma region first face dictates orientation:
+			size_t seed_1 = static_cast<size_t>(-1);
+			for (size_t i = 0; i < num_sphere_seeds; i++)
 			{
-				#pragma region first face dictates orientation:
-				size_t seed_1 = static_cast<size_t>(-1);
-				for (size_t i = 0; i < num_sphere_seeds; i++)
-				{
-					const size_t candidate = sphere_seeds[i];
-					if (seeds->tree_point_is_active(candidate)) { seed_1 = candidate; break; }
-				}
-				if (seed_1 == static_cast<size_t>(-1)) continue;
-				size_t* attrib = seeds->get_tree_point_attrib(seed_1);
+				const size_t candidate = sphere_seeds[i];
+				if (seeds->tree_point_is_active(candidate)) { seed_1 = candidate; cand = i; break; }
+			}
+			if (seed_1 == static_cast<size_t>(-1)) continue;
+			size_t* attrib = seeds->get_tree_point_attrib(seed_1);
 
-				size_t seed_2(attrib[1]);
-				if (seed_2 >= num_seeds) continue;
-				if (!seeds->tree_point_is_active(seed_2)) continue;
-				size_t si(attrib[2]), sj(attrib[3]), sk(attrib[4]);
+			size_t seed_2(attrib[1]);
+			if (seed_2 >= num_seeds) continue;
+			if (!seeds->tree_point_is_active(seed_2)) continue;
+			size_t si(attrib[2]), sj(attrib[3]), sk(attrib[4]);
 
-				while (si != isphere)
-				{
-					size_t tmp = si; si = sj; sj = sk; sk = tmp; // rotate indices
-				}
-
-				double* x_1 = seeds->get_tree_point(seed_1);
-				double* x_2 = seeds->get_tree_point(seed_2);
-
-				face_corners[0] = surface_spheres->get_tree_point(si);
-				face_corners[1] = surface_spheres->get_tree_point(sj);
-				face_corners[2] = surface_spheres->get_tree_point(sk);
-
-				_geom.get_3d_triangle_normal(face_corners, face_normal);
-
-				double dot(0.0);
-				for (size_t idim = 0; idim < 3; idim++) dot += (x_2[idim] - x_1[idim]) * face_normal[idim];
-
-				if (dot > 0.0)
-				{
-					seeds->set_tree_point_attrib(seed_1, 5, static_cast<size_t>(1)); // inside
-					seeds->set_tree_point_attrib(seed_2, 5, static_cast<size_t>(2)); // outside
-				}
-				else
-				{
-					seeds->set_tree_point_attrib(seed_1, 5, static_cast<size_t>(2)); // outside
-					seeds->set_tree_point_attrib(seed_2, 5, static_cast<size_t>(1)); // inside
-				}
-				first_neighbor = sj;
-				jsphere = sk;
-				#pragma endregion
+			while (si != isphere)
+			{
+				size_t tmp = si; si = sj; sj = sk; sk = tmp; // rotate indices
 			}
 
+			double* x_1 = seeds->get_tree_point(seed_1);
+			double* x_2 = seeds->get_tree_point(seed_2);
+
+			face_corners[0] = surface_spheres->get_tree_point(si);
+			face_corners[1] = surface_spheres->get_tree_point(sj);
+			face_corners[2] = surface_spheres->get_tree_point(sk);
+
+			_geom.get_3d_triangle_normal(face_corners, face_normal);
+
+			double dot(0.0);
+			for (size_t idim = 0; idim < 3; idim++) dot += (x_2[idim] - x_1[idim]) * face_normal[idim];
+
+			if (dot > 0.0)
+			{
+				attrib[5] = 1; // inside
+				attrib = seeds->get_tree_point_attrib(seed_2);
+				attrib[5] = 2; // outside
+			}
+			else
+			{
+				attrib[5] = 2; // outside
+				attrib = seeds->get_tree_point_attrib(seed_2);
+				attrib[5] = 1; // inside
+			}
+			first_neighbor = sj;
+			jsphere = sk;
+			#pragma endregion
+			
+			//std::cout<<seed_1<<" "<<seeds->get_tree_point_attrib(seed_1,6)<<" "<<seed_2<<" "<<seeds->get_tree_point_attrib(seed_2,6)<<std::endl;
 			while (true)
 			{
 				#pragma region Mark loop seeds:
@@ -648,7 +673,7 @@ void Generator::color_surface_seeds(int num_faces, MeshingTree *surface_spheres,
 
 				for (size_t i = 0; i < num_sphere_seeds; i++)
 				{
-					size_t seed_1(sphere_seeds[i]);
+					size_t seed_1(sphere_seeds[cand + 1 + i]);
 					if (!seeds->tree_point_is_active(seed_1)) continue;
 					size_t* attrib = seeds->get_tree_point_attrib(seed_1);
 
@@ -672,13 +697,12 @@ void Generator::color_surface_seeds(int num_faces, MeshingTree *surface_spheres,
 
 				for (size_t i = 0; i < num_sphere_seeds; i++)
 				{
-					size_t seed_1(sphere_seeds[i]);
+					size_t seed_1(sphere_seeds[cand + 1 + i]);
 					if (!seeds->tree_point_is_active(seed_1)) continue;
 					size_t* attrib = seeds->get_tree_point_attrib(seed_1);
 
 					size_t seed_2(attrib[1]);
-					if (seed_2 >= num_seeds) continue;
-					if (!seeds->tree_point_is_active(seed_2)) continue;
+					if (seed_2 >= num_seeds || !seeds->tree_point_is_active(seed_2)) continue;
 					size_t si(attrib[2]), sj(attrib[3]), sk(attrib[4]);
 
 					while (si != isphere)
@@ -708,13 +732,15 @@ void Generator::color_surface_seeds(int num_faces, MeshingTree *surface_spheres,
 
 					if (dot > 0.0)
 					{
-						seeds->set_tree_point_attrib(seed_1, 5, static_cast<size_t>(1)); // inside
-						seeds->set_tree_point_attrib(seed_2, 5, static_cast<size_t>(2)); // outside
+						attrib[5] = 1; // inside
+						attrib = seeds->get_tree_point_attrib(seed_2);
+						attrib[5] = 2; // outside
 					}
 					else
 					{
-						seeds->set_tree_point_attrib(seed_1, 5, static_cast<size_t>(2)); // outside
-						seeds->set_tree_point_attrib(seed_2, 5, static_cast<size_t>(1)); // inside
+						attrib[5] = 2; // outside
+						attrib = seeds->get_tree_point_attrib(seed_2);
+						attrib[5] = 1; // inside
 					}
 					jsphere = sk;
 					if (jsphere == first_neighbor) done = true;
@@ -869,7 +895,7 @@ void Generator::color_surface_seeds(int num_faces, MeshingTree *surface_spheres,
 		seeds_sizing[iseed] = x[3];
 	}
 
-  generate_seed_csv("seeds.csv", 3, num_seeds, seedes, seeds_sizing, seeds_region_id);
+   generate_seed_csv("seeds.csv", 3, num_seeds, seedes, seeds_sizing, seeds_region_id);
 }
 	
 

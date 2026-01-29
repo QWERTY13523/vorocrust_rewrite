@@ -19,7 +19,7 @@ int main()
     generator.read_obj_faces("./data/obj/Ours_2500_mobius1_Remesh.obj",face_flat, num_faces1);
     generator.generate_surface_seeds(num_points, points, num_faces, faces,
          spheres, upper_seeds, lower_seeds);
-    generator.color_surface_seeds(num_faces, spheres,upper_seeds, lower_seeds, seeds,
+    generator.color_surface_seeds(num_faces1, spheres,upper_seeds, lower_seeds, seeds,
         face_flat, seedes, seeds_region_id, seeds_sizing);
-    generator.generate_seed_csv("seeds.csv",3,seeds->get_num_tree_points(),seedes, seeds_sizing, seeds_region_id);
+    //generator.generate_seed_csv("seeds.csv",3,seeds->get_num_tree_points(),seedes, seeds_sizing, seeds_region_id);
 }
