@@ -18,7 +18,7 @@ int Methods::get_overlapping_spheres(double* sphere, MeshingTree* spheres,
 	double r = rclosest + 3 * hclosest;
 	if (r < sphere[3]) r = sphere[3];
 
-	double R = r * 5;
+	double R = r * 10;
 	R += r;
 
 	size_t num(0), cap(100);

@@ -308,9 +308,19 @@ void Generator::generate_surface_seeds(size_t num_points, double **points, size_
 
                 centers[0] = sphere_i; centers[1] = sphere_j; centers[2] = sphere_k;
                 radii[0] = sphere_i[3]; radii[1] = sphere_j[3]; radii[2] = sphere_k[3];
-                _geom.get_power_vertex(3, 3, centers, radii, c_ijk);
-
+                
+                // Debug: check power vertex calculation
+                bool pv_valid = _geom.get_power_vertex(3, 3, centers, radii, c_ijk);
+                if (!pv_valid) {
+                    std::cout << "Power vertex calculation failed for spheres " 
+                              << sphere_index_i << ", " << sphere_index_j << ", " << sphere_index_k << std::endl;
+                    continue;
+                }
+                
+                // Debug: verify distances from power vertex to each sphere center
                 double hi = _geom.distance(3, c_ijk, sphere_i);
+                double hj = _geom.distance(3, c_ijk, sphere_j);
+                double hk = _geom.distance(3, c_ijk, sphere_k);
                 if (hi > sphere_i[3] - 1E-10) continue;
 
                 double vi = sqrt(sphere_i[3] * sphere_i[3] - hi * hi);
@@ -745,6 +755,104 @@ void Generator::color_surface_seeds(int num_faces, MeshingTree *surface_spheres,
 
 	delete[] face_normal;
 	delete[] face_corners;
+
+	// Coloring Disjoint Subgraphs
+	size_t region_id(0);
+	while (true)
+	{
+		bool done = true;
+		for (size_t iseed = 0; iseed < num_seeds; iseed++)
+		{
+			if (!seeds->tree_point_is_active(iseed)) continue;
+			size_t* attrib = seeds->get_tree_point_attrib(iseed);
+			if (attrib[5] != 0) continue;
+			region_id++; attrib[5] = region_id;
+			done = false;
+			break;
+		}
+		if (done) break;
+
+		while (true)
+		{
+			// Flooding Subregion
+			bool subregion_done(true);
+			for (size_t iseed = 0; iseed < num_seeds; iseed++)
+			{
+				if (!seeds->tree_point_is_active(iseed)) continue;
+				size_t* attrib = seeds->get_tree_point_attrib(iseed);
+				if (attrib[5] != region_id) continue;
+
+				std::vector<size_t> neighbor_seeds;
+				seeds->graph_get_neighbors(iseed, neighbor_seeds);
+				if (neighbor_seeds.empty()) continue;
+
+				for (size_t i = 0; i < neighbor_seeds.size(); i++)
+				{
+					size_t neighbor_seed = neighbor_seeds[i];
+					if (!seeds->tree_point_is_active(neighbor_seed)) continue;
+
+					size_t* neighbor_attrib = seeds->get_tree_point_attrib(neighbor_seed);
+
+					if (neighbor_attrib[5] != 0)
+					{
+						if (neighbor_attrib[5] != region_id)
+						{
+							std::cout << "Error::Invalid coloring!!!" << std::endl;
+						}
+						continue;
+					}
+					neighbor_attrib[5] = region_id;
+					subregion_done = false;
+				}
+			}
+			if (subregion_done) break;
+		}
+	}
+
+	size_t num_subregions = region_id > 0 ? region_id - 1 : 0;
+
+	// Marking ghost seeds
+	if (num_seeds > 0)
+	{
+		double xmin[3], xmax[3];
+		for (size_t idim = 0; idim < 3; idim++) xmin[idim] = DBL_MAX;
+		for (size_t idim = 0; idim < 3; idim++) xmax[idim] = -DBL_MAX;
+
+		for (size_t iseed = 0; iseed < num_seeds; iseed++)
+		{
+			if (!seeds->tree_point_is_active(iseed)) continue;
+			double* xseed = seeds->get_tree_point(iseed);
+			for (size_t idim = 0; idim < 3; idim++)
+			{
+				if (xseed[idim] < xmin[idim]) xmin[idim] = xseed[idim];
+				if (xseed[idim] > xmax[idim]) xmax[idim] = xseed[idim];
+			}
+		}
+		double xfar[3];
+		for (size_t idim = 0; idim < 3; idim++) xfar[idim] = xmax[idim] + 2.0 * (xmax[idim] - xmin[idim]);
+
+		size_t iclosest(0); double hclosest(DBL_MAX);
+		seeds->get_closest_tree_point(xfar, iclosest, hclosest);
+
+		size_t* attrib = seeds->get_tree_point_attrib(iclosest);
+		size_t ghost_region_id = attrib[5];
+
+		// Mark ghost region as 0, shift other region IDs down
+		for (size_t iseed = 0; iseed < num_seeds; iseed++)
+		{
+			if (!seeds->tree_point_is_active(iseed)) continue;
+			size_t* attrib = seeds->get_tree_point_attrib(iseed);
+			if (attrib[5] == ghost_region_id) attrib[5] = 0;
+		}
+		for (size_t iseed = 0; iseed < num_seeds; iseed++)
+		{
+			if (!seeds->tree_point_is_active(iseed)) continue;
+			size_t* attrib = seeds->get_tree_point_attrib(iseed);
+			if (attrib[5] > ghost_region_id) attrib[5]--;
+		}
+	}
+
+	std::cout << "  * Number of subregions is " << num_subregions << std::endl;
 
 	num_seeds = seeds->get_num_tree_points();
 	seedes = new double[num_seeds * 3];

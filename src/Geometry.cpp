@@ -59,61 +59,135 @@ double Geometry::cos_angle(size_t num_dim, double* x, double* y, double* z)
 	#pragma endregion
 }
 
+void Geometry::get_power_vertex(size_t num_dim, double* co, double ro, double* c1, double r1, double* pv)
+{
+	#pragma region Get Power Vertex:
+	double h(0.0);
+	for (size_t idim = 0; idim < num_dim; idim++)
+	{
+		double dx = c1[idim] - co[idim];
+		h += dx * dx;
+	}
+	h = sqrt(h);
+
+	double ho = (h * h + ro * ro - r1 * r1) / (2 * h);
+
+	for (size_t idim = 0; idim < num_dim; idim++) pv[idim] = co[idim] + ho * (c1[idim] - co[idim]) / h;
+
+	#pragma endregion
+}
+
 bool Geometry::get_power_vertex(size_t num_dim, size_t num_points, double** centers, double* radii, double* pv)
 {
-    // 1. 基础检查
-    if (num_dim == 0 || num_points < num_dim + 1) return false;
+	#pragma region Power Vertex of n spheres:
 
-    // 2. 构建线性系统 Ax = b
-    // 我们有 (num_points - 1) 个方程，num_dim 个变量
-    // A 的每一行是两个球心的向量差: 2 * (c_i - c_0)
-    Eigen::MatrixXd A(num_points - 1, num_dim);
-    Eigen::VectorXd b(num_points - 1);
+	double** c = new double*[num_points]; double* r = new double[num_points];
+	for (size_t i = 0; i < num_points; i++)
+	{
+		c[i] = centers[i]; r[i] = radii[i];
+	}
 
-    // 预计算第0个球的参数
-    Eigen::VectorXd c0(num_dim);
-    for (size_t d = 0; d < num_dim; ++d) c0[d] = centers[0][d];
-    double pow0 = c0.squaredNorm() - radii[0] * radii[0];
+	double** basis = new double*[num_dim];
+	for (size_t ibasis = 0; ibasis < num_dim; ibasis++)
+	{
+		basis[ibasis] = new double[num_dim];
+		for (size_t idim = 0; idim < num_dim; idim++) basis[ibasis][idim] = 0.0;
+		basis[ibasis][ibasis] = 1.0;
+	}
 
-    for (size_t i = 1; i < num_points; ++i)
-    {
-        Eigen::VectorXd ci(num_dim);
-        for (size_t d = 0; d < num_dim; ++d) ci[d] = centers[i][d];
-        
-        double pow_i = ci.squaredNorm() - radii[i] * radii[i];
+	double* xst = new double[num_dim];  double* dir = new double[num_dim];
+	double* dart = new double[num_dim]; double* vect = new double[num_dim];
 
-        // 填充 A 的第 (i-1) 行: 2 * (c_i - c_0)
-        A.row(i - 1) = 2.0 * (ci - c0);
-        
-        // 填充 b 的第 (i-1) 行: pow_i - pow0
-        b(i - 1) = pow_i - pow0;
-    }
+	for (size_t idim = 0; idim < num_dim; idim++) xst[idim] = c[0][idim];
 
-    // 3. 使用列主元 Householder QR 分解求解
-    // 这种方法对于超定方程组（Overdetermined）会自动给出最小二乘解
-    // 对于病态矩阵（接近奇异），它比普通 LU 分解更稳定
-    Eigen::ColPivHouseholderQR<Eigen::MatrixXd> solver(A);
-    
-    // 检查矩阵的秩，如果秩小于维度，说明球心共面/共线，无法确定唯一的根心
-    if (solver.rank() < num_dim) {
-        return false; // 无唯一解
-    }
+	double closest_distance = 0.0; bool trimming_failed(false);
+	for (size_t ispoke = 0; ispoke < num_points - 1; ispoke++)
+	{
+		// throw a random spoke
+		_rsampler.sample_uniformly_from_unit_sphere(dart, num_dim - ispoke);
 
-    Eigen::VectorXd x = solver.solve(b);
+		for (size_t idim = 0; idim < num_dim; idim++) dir[idim] = 0.0;
 
-    // 4. (可选) 验证解的质量
-    // 如果你希望在“无解”时严格返回 false，而不是返回近似解，
-    // 可以检查残差 (Ax - b) 的模长。
-    if ((A * x - b).norm() > 1e-5) {
-        // 残差过大，说明这些球并没有公共的根心（Power Vertex）
-        // 如果你的应用允许误差，可以去掉这个检查
-        return false; 
-    }
+		for (size_t jbasis = ispoke; jbasis < num_dim; jbasis++)
+		{
+			for (size_t idim = 0; idim < num_dim; idim++) dir[idim] += dart[jbasis - ispoke] * basis[jbasis][idim];
+		}
 
-    // 5. 输出结果
-    for (size_t d = 0; d < num_dim; ++d) pv[d] = x[d];
+		// trim using all remaining points
+		double alpha_min(DBL_MAX); size_t neighbor_index(0);
+		for (size_t ipoint = ispoke + 1; ipoint < num_points; ipoint++)
+		{
+			double* qv = new double[num_dim]; double* mv = new double[num_dim];
+			get_power_vertex(num_dim, c[0], r[0], c[ipoint], r[ipoint], qv);
+			for (size_t idim = 0; idim < num_dim; idim++) mv[idim] = c[ipoint][idim] - c[0][idim];
 
-    return true;
+			double dot_1(0.0), dot_2(0.0);
+			for (size_t idim = 0; idim < num_dim; idim++)
+			{
+				dot_1 += (qv[idim] - xst[idim]) * mv[idim];
+				dot_2 += dir[idim] * mv[idim];
+			}
+			delete[] qv; delete[] mv;
+			if (fabs(dot_2) < 1E-10) continue; // spoke is parallel to Power Hyperplane
+
+			double alpha = dot_1 / dot_2;
+			if (fabs(alpha) < fabs(alpha_min))
+			{
+				alpha_min = alpha; neighbor_index = ipoint;
+			}
+		}
+		if (neighbor_index == 0)
+		{
+			for (size_t ibasis = 0; ibasis < num_dim; ibasis++) delete[] basis[ibasis];
+			delete[] basis; delete[] xst; delete[] dir; delete[] dart; delete[] vect;
+			delete[] c; delete[] r;
+			return false;
+		}
+
+		// update spoke start
+		for (size_t idim = 0; idim < num_dim; idim++) xst[idim] += alpha_min * dir[idim];
+
+		double* tmp = c[neighbor_index]; c[neighbor_index] = c[ispoke + 1]; c[ispoke + 1] = tmp;
+		double rtmp = r[neighbor_index]; r[neighbor_index] = r[ispoke + 1]; r[ispoke + 1] = rtmp;
+
+		// update basis
+		for (size_t idim = 0; idim < num_dim; idim++) vect[idim] = c[ispoke + 1][idim] - c[0][idim];
+
+		double norm;
+		get_normal_component(num_dim, ispoke, basis, vect, norm);
+		for (size_t idim = 0; idim < num_dim; idim++) basis[ispoke][idim] = vect[idim];
+
+		// update remaining basis
+		for (size_t jbasis = ispoke + 1; jbasis < num_dim; jbasis++)
+		{
+			for (size_t idim = 0; idim < num_dim; idim++)
+			{
+				for (size_t jdim = 0; jdim < num_dim; jdim++) vect[jdim] = 0.0;
+				vect[idim] = 1.0;
+				get_normal_component(num_dim, jbasis, basis, vect, norm);
+				if (norm > 0.1) break;
+			}
+			for (size_t idim = 0; idim < num_dim; idim++) basis[jbasis][idim] = vect[idim];
+		}
+	}
+
+	// project the Voronoi vertex to the space of the points
+	for (size_t idim = 0; idim < num_dim; idim++) vect[idim] = xst[idim] - c[0][idim];
+
+	for (size_t jbasis = num_points - 1; jbasis < num_dim; jbasis++)
+	{
+		double dot(0.0);
+		for (size_t idim = 0; idim < num_dim; idim++) dot += vect[idim] * basis[jbasis][idim];
+		for (size_t idim = 0; idim < num_dim; idim++) vect[idim] -= dot * basis[jbasis][idim];
+	}
+
+	for (size_t idim = 0; idim < num_dim; idim++) pv[idim] = c[0][idim] + vect[idim];
+
+	for (size_t ibasis = 0; ibasis < num_dim; ibasis++) delete[] basis[ibasis];
+	delete[] basis; delete[] xst; delete[] dir; delete[] dart; delete[] vect;
+	delete[] c; delete[] r;
+	return true;
+	#pragma endregion
 }
 
 int Geometry::get_normal_component(size_t num_dim, size_t num_basis, double** basis, double* vect, double &norm)

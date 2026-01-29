@@ -2,6 +2,7 @@
 
 #include<cmath>
 #include <Eigen/Dense>
+#include "RandomSampler.h"
 #include <vector>
 #include <iostream>
 #include <climits> 
@@ -17,6 +18,8 @@ public:
     double distance(size_t num_dim, double* x, double* y);
 
     double cos_angle(size_t num_dim, double* x, double* y, double* z);
+
+	void get_power_vertex(size_t num_dim, double* co, double ro, double* c1, double r1, double* pv);
 
 	bool get_power_vertex(size_t num_dim, size_t num_points, double** centers, double* radii, double* pv);
 
@@ -37,4 +40,6 @@ public:
 	int project_to_3d_line_segment(double* p, double* xo, double* xn, double* q, double& proj_dist);
 
 	int project_to_3d_line(double* p, double* xo, double* edir, double* q, double &proj_dist);
+private:
+	MeshingRandomSampler _rsampler;
 };

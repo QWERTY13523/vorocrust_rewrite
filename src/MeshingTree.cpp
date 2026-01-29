@@ -6,6 +6,7 @@ MeshingTree::MeshingTree()
 {
     _xmin.assign(3,DBL_MAX);
     _xmax.assign(3,-DBL_MAX);
+    _num_dim = 0;
 }
 
 int MeshingTree::graph_connect_nodes(size_t ipoint, size_t jpoint)
@@ -17,6 +18,9 @@ int MeshingTree::graph_connect_nodes(size_t ipoint, size_t jpoint)
 
 int MeshingTree::graph_connect(size_t ipoint, size_t jpoint)
 {
+    size_t max_index = std::max(ipoint, jpoint);
+    if (_graph.size() <= max_index)
+        _graph.resize(max_index + 1);
     if(graph_connected(ipoint, jpoint)) return 0;
     _graph[ipoint].push_back(jpoint);
     return 0;
@@ -36,6 +40,8 @@ bool MeshingTree::graph_connected(size_t ipoint, size_t jpoint)
 
 int MeshingTree::add_tree_point(size_t num_dim, double* x, double* normal, size_t* attrib)
 {
+	
+    _num_dim = static_cast<int>(num_dim);
     if (_xmin.empty())
         _xmin.assign(num_dim, DBL_MAX);
     if (_xmax.empty())
@@ -47,20 +53,9 @@ int MeshingTree::add_tree_point(size_t num_dim, double* x, double* normal, size_
         _xmax[idim] = std::max(_xmax[idim], x[idim]);
     }
 
-    if (_points.empty())
-    {
-        _tree_left.push_back(0);
-        _tree_right.push_back(0);
-        _tree_root = 0;
-        _tree_max_height = 1;
-    }
-    else
-    {
-        _tree_left.push_back(_points.size());
-        _tree_right.push_back(_points.size());
-        kd_tree_add_point(_points.size());
-    }
-
+    size_t new_index = _points.size();
+    
+    // 先添加点到 _points
     _points.emplace_back(x, x + num_dim);
     if (normal)
         _points_normal.emplace_back(normal, normal + num_dim);
@@ -74,6 +69,21 @@ int MeshingTree::add_tree_point(size_t num_dim, double* x, double* normal, size_
     }
     else
         _points_attrib.emplace_back();
+
+    // 再更新 kd-tree
+    if (new_index == 0)
+    {
+        _tree_left.push_back(0);
+        _tree_right.push_back(0);
+        _tree_root = 0;
+        _tree_max_height = 1;
+    }
+    else
+    {
+        _tree_left.push_back(new_index);
+        _tree_right.push_back(new_index);
+        kd_tree_add_point(new_index);
+    }
 
     if (_graph.size() < _points.size())
         _graph.resize(_points.size());
@@ -371,7 +381,11 @@ int MeshingTree::kd_tree_add_point(size_t seed_index)
 {
 	#pragma region kd tree add point:
 	// insert sphere into tree
+	if (seed_index >= _points.size()) return 1;
+	if (_points.empty()) return 1;
+	if (_num_dim <= 0) return 1;
 	size_t parent_index(_tree_root); size_t d_index(0);
+	if (parent_index >= _points.size()) parent_index = 0;
 	size_t branch_height(1);
 	while (true)
 	{

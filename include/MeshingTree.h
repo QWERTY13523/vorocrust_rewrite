@@ -27,7 +27,11 @@ public:
 
     int reset_graph() { _graph.clear(); return 0;}
 
-    int graph_get_neighbors(size_t ipoint, std::vector<size_t>& neighbors) { neighbors = _graph[ipoint]; return 0;};
+    int graph_get_neighbors(size_t ipoint, std::vector<size_t>& neighbors) { 
+        if (ipoint < _graph.size()) neighbors = _graph[ipoint]; 
+        else neighbors.clear();
+        return 0;
+    };
 
     int graph_connect_nodes(size_t ipoint, size_t jpoint);
     
@@ -136,8 +140,8 @@ private:
 	bool find_brute(size_t entry, size_t* I, size_t num_entries);
 
 	int quicksort(double* x, double* y1, double* y2, size_t* I, size_t left, size_t right);
-    int _num_dim;
-    int _capacity;
+    size_t _num_dim;
+    size_t _capacity;
     std::vector<std::vector<double>> _points;
     std::vector<std::vector<double>> _points_normal;
 
@@ -148,8 +152,8 @@ private:
 
     std::vector<std::vector<size_t>> _graph;
 
-    int _tree_root;
-    int _tree_max_height;
+    size_t _tree_root;
+    size_t _tree_max_height;
     std::vector<size_t> _tree_left;
     std::vector<size_t> _tree_right;
     
