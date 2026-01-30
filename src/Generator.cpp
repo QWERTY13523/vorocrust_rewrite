@@ -486,418 +486,754 @@ void Generator::generate_surface_seeds(size_t num_points, double **points, size_
 		std::cout << "  * Min. relative distance between lower and upper seeds = " << min_dst_ul << std::endl;
 }
 
-void Generator::color_surface_seeds(int num_faces, MeshingTree *surface_spheres,MeshingTree *upper_seeds, MeshingTree *lower_seeds,MeshingTree *seeds,
-        std::vector<int> face, double* &seedes, size_t* &seeds_region_id, double* &seeds_sizing)
+void Generator::color_surface_seeds(int num_faces, MeshingTree *surface_spheres, MeshingTree *upper_seeds, MeshingTree *lower_seeds, MeshingTree *seeds,
+    std::vector<int> face, double* &seedes, size_t* &seeds_region_id, double* &seeds_sizing)
 {
+    std::cout << "[Info] Starting robust color_surface_seeds..." << std::endl;
 
-	size_t actual_num_faces = face.size() / 3;
-    std::cout << "[Debug] In color_surface_seeds:" << std::endl;
-    std::cout << "  - Face vector size: " << face.size() << " (implies " << actual_num_faces << " faces)" << std::endl;
-    
+    // 1. Merge Upper and Lower seeds into 'seeds' tree
     size_t num_upper_seeds(upper_seeds->get_num_tree_points());
     size_t num_lower_seeds(lower_seeds->get_num_tree_points());
-    std::cout << "  - Upper seeds: " << num_upper_seeds << ", Lower seeds: " << num_lower_seeds << std::endl;
 
-    // adjust id of seed pair for upper seeds
+    // Adjust id of seed pair for upper seeds
     for (size_t iseed = 0; iseed < num_upper_seeds; iseed++)
     {
-      // copy point location, normal and attributes
-      double x[4];
-      upper_seeds->get_tree_point(iseed, 4, x);
-      double* normal = upper_seeds->get_tree_point_normal(iseed);
-      size_t* attrib = upper_seeds->get_tree_point_attrib(iseed);
-      attrib[1] += num_upper_seeds;
-      seeds->add_tree_point(4, x, normal, attrib);
+        double x[4];
+        upper_seeds->get_tree_point(iseed, 4, x);
+        double* normal = upper_seeds->get_tree_point_normal(iseed);
+        size_t* attrib = upper_seeds->get_tree_point_attrib(iseed);
+        attrib[1] += num_upper_seeds; // Update pair index
+        seeds->add_tree_point(4, x, normal, attrib);
     }
     upper_seeds->clear_memory();
 
     for (size_t iseed = 0; iseed < num_lower_seeds; iseed++)
     {
-      // copy point location, normal and attributes
-      double x[4];
-      lower_seeds->get_tree_point(iseed, 4, x);
-      double* normal = lower_seeds->get_tree_point_normal(iseed);
-      size_t* attrib = lower_seeds->get_tree_point_attrib(iseed);
-      seeds->add_tree_point(4, x, normal, attrib);
+        double x[4];
+        lower_seeds->get_tree_point(iseed, 4, x);
+        double* normal = lower_seeds->get_tree_point_normal(iseed);
+        size_t* attrib = lower_seeds->get_tree_point_attrib(iseed);
+        seeds->add_tree_point(4, x, normal, attrib);
     }
     lower_seeds->clear_memory();
 
+    // 2. Filter seeds based on OBJ faces (if provided)
     size_t num_seeds(seeds->get_num_tree_points());
-		if (num_faces > 0 && !face.empty())
-		{
-			struct FaceKeyHash
-			{
-				size_t operator()(const std::array<size_t, 3>& a) const noexcept
-				{
-					size_t h = 0;
-					h ^= std::hash<size_t>{}(a[0]) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
-					h ^= std::hash<size_t>{}(a[1]) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
-					h ^= std::hash<size_t>{}(a[2]) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
-					return h;
-				}
-			};
+    if (num_faces > 0 && !face.empty())
+    {
+        struct FaceKeyHash {
+            size_t operator()(const std::array<size_t, 3>& a) const noexcept {
+                size_t h = 0;
+                h ^= std::hash<size_t>{}(a[0]) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+                h ^= std::hash<size_t>{}(a[1]) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+                h ^= std::hash<size_t>{}(a[2]) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+                return h;
+            }
+        };
 
-			std::unordered_set<std::array<size_t, 3>, FaceKeyHash> face_set;
-			face_set.reserve(static_cast<size_t>(num_faces) * 2);
-			for (int i = 0; i < num_faces; i++)
-			{
-				size_t a = static_cast<size_t>(face[3 * i + 0]);
-				size_t b = static_cast<size_t>(face[3 * i + 1]);
-				size_t c = static_cast<size_t>(face[3 * i + 2]);
-				std::array<size_t, 3> key{a, b, c};
-				std::sort(key.begin(), key.end());
-				face_set.insert(key);
-			}
-
-			int max_face_idx = -1;
-        for(int idx : face) {
-            if(idx > max_face_idx) max_face_idx = idx;
+        std::unordered_set<std::array<size_t, 3>, FaceKeyHash> face_set;
+        face_set.reserve(static_cast<size_t>(num_faces) * 2);
+        for (int i = 0; i < num_faces; i++)
+        {
+            size_t a = static_cast<size_t>(face[3 * i + 0]);
+            size_t b = static_cast<size_t>(face[3 * i + 1]);
+            size_t c = static_cast<size_t>(face[3 * i + 2]);
+            std::array<size_t, 3> key{ a, b, c };
+            std::sort(key.begin(), key.end());
+            face_set.insert(key);
         }
-        std::cout << "[Debug] Max Vertex Index in OBJ: " << max_face_idx << std::endl;
-        std::cout << "[Debug] Total Spheres (Seeds' source): " << surface_spheres->get_num_tree_points() << std::endl;
+
+        for (size_t iseed = 0; iseed < num_seeds; iseed++)
+        {
+            if (!seeds->tree_point_is_active(iseed)) continue;
+            size_t* attrib = seeds->get_tree_point_attrib(iseed);
+            const size_t jseed = attrib[1];
+            if (jseed >= num_seeds) continue;
+            if (iseed > jseed) continue; // Only process one of the pair
+            if (!seeds->tree_point_is_active(jseed)) continue;
+
+            std::array<size_t, 3> key{ attrib[2], attrib[3], attrib[4] };
+            std::sort(key.begin(), key.end());
+            if (face_set.find(key) == face_set.end())
+            {
+                seeds->lazy_delete_tree_point(iseed);
+                seeds->lazy_delete_tree_point(jseed);
+            }
+        }
+    }
+
+    // 3. Build connectivity graph
+    for (size_t iseed = 0; iseed < num_seeds; iseed++)
+    {
+        if (!seeds->tree_point_is_active(iseed)) continue;
+        size_t* attrib = seeds->get_tree_point_attrib(iseed);
+        size_t si(attrib[2]), sj(attrib[3]), sk(attrib[4]);
+        surface_spheres->graph_connect(si, iseed);
+        surface_spheres->graph_connect(sj, iseed);
+        surface_spheres->graph_connect(sk, iseed);
+    }
+
+    double* face_normal = new double[3];
+    double** face_corners = new double*[3];
+    size_t num_spheres(surface_spheres->get_num_tree_points());
+
+    // 4. Propagate Orientation (The Vorocrust Method)
+    for (size_t isphere = 0; isphere < num_spheres; isphere++)
+    {
+        std::vector<size_t> sphere_seeds;
+        surface_spheres->graph_get_neighbors(isphere, sphere_seeds);
+        if (sphere_seeds.empty()) continue;
+
+        size_t num_sphere_seeds = sphere_seeds.size();
+
+        // [Step A] Reset markers for this sphere
+        for (size_t i = 0; i < num_sphere_seeds; i++)
+        {
+            size_t seed_i(sphere_seeds[i]);
+            size_t* attrib = seeds->get_tree_point_attrib(seed_i);
+            attrib[5] = 0; // 0 means unvisited/undefined for this local loop
+        }
+
+        size_t first_neighbor(isphere), jsphere(isphere);
+
+        // [Step B] Pick the first seed to dictate orientation
+        if (true)
+        {
+            size_t seed_1(sphere_seeds[0]); // Pick the first valid one
+            size_t* attrib = seeds->get_tree_point_attrib(seed_1);
+
+            size_t seed_2(attrib[1]);
+            size_t si(attrib[2]), sj(attrib[3]), sk(attrib[4]);
+
+            // [CRITICAL] Rotate indices so 'si' is the current sphere
+            while (si != isphere)
+            {
+                size_t tmp = si; si = sj; sj = sk; sk = tmp;
+            }
+
+            double* x_1 = seeds->get_tree_point(seed_1);
+            double* x_2 = seeds->get_tree_point(seed_2);
+
+            face_corners[0] = surface_spheres->get_tree_point(si);
+            face_corners[1] = surface_spheres->get_tree_point(sj);
+            face_corners[2] = surface_spheres->get_tree_point(sk);
+
+            _geom.get_3d_triangle_normal(face_corners, face_normal);
+
+            double dot(0.0);
+            for (size_t idim = 0; idim < 3; idim++) dot += (x_2[idim] - x_1[idim]) * face_normal[idim];
+
+            if (dot > 0.0)
+            {
+                attrib[5] = 1; // 1: Inside
+                attrib = seeds->get_tree_point_attrib(seed_2);
+                attrib[5] = 2; // 2: Outside
+            }
+            else
+            {
+                attrib[5] = 2; // Outside
+                attrib = seeds->get_tree_point_attrib(seed_2);
+                attrib[5] = 1; // Inside
+            }
+            first_neighbor = sj; // Record where we started
+            jsphere = sk;        // The vertex we are moving towards
+        }
+
+        // [Step C] Walk the loop (Topological Propagation)
+        while (true)
+        {
+            bool done(true);
+
+            // Look for the next neighbor in the chain
+            for (size_t i = 0; i < num_sphere_seeds; i++)
+            {
+                size_t seed_1(sphere_seeds[i]);
+                size_t* attrib = seeds->get_tree_point_attrib(seed_1);
+
+                if (attrib[5] != 0) continue; // Already processed
+
+                size_t seed_2(attrib[1]);
+                size_t si(attrib[2]), sj(attrib[3]), sk(attrib[4]);
+
+                // [CRITICAL] Rotate indices again
+                while (si != isphere)
+                {
+                    size_t tmp = si; si = sj; sj = sk; sk = tmp;
+                }
+
+                // We are looking for a triangle that shares the edge (si, jsphere)
+                // In a valid traversal, one of sj or sk MUST be jsphere.
+                if (sj != jsphere && sk != jsphere) continue; // Not the neighbor we want
+
+                // [CRITICAL FIX] Enforce winding order
+                // If sj is NOT the shared vertex, it means the triangle is flipped relative to our traversal.
+                // We MUST swap sj and sk to maintain consistent normal direction.
+                if (sj != jsphere)
+                {
+                    size_t tmp = sj; sj = sk; sk = tmp;
+                }
+
+                // Now calculate normal with the CONSISTENT vertex order (si, sj, sk)
+                double* x_1 = seeds->get_tree_point(seed_1);
+                double* x_2 = seeds->get_tree_point(seed_2);
+
+                face_corners[0] = surface_spheres->get_tree_point(si);
+                face_corners[1] = surface_spheres->get_tree_point(sj);
+                face_corners[2] = surface_spheres->get_tree_point(sk);
+
+                _geom.get_3d_triangle_normal(face_corners, face_normal);
+
+                double dot(0.0);
+                for (size_t idim = 0; idim < 3; idim++) dot += (x_2[idim] - x_1[idim]) * face_normal[idim];
+
+                if (dot > 0.0)
+                {
+                    attrib[5] = 1; // Inside
+                    attrib = seeds->get_tree_point_attrib(seed_2);
+                    attrib[5] = 2; // Outside
+                }
+                else
+                {
+                    attrib[5] = 2; // Outside
+                    attrib = seeds->get_tree_point_attrib(seed_2);
+                    attrib[5] = 1; // Inside
+                }
+
+                jsphere = sk; // Advance to the next vertex
+                if (jsphere == first_neighbor) done = true; // Loop closed
+                
+                done = false; // Found a valid step, continue the while loop
+                break; 
+            }
+            if (done) break; // No more neighbors found or loop closed
+        }
+
+        // [Step D] Connect compatible seeds
+        // Now that seeds on this sphere are locally consistent, connect them in the graph
+        for (size_t i = 0; i < num_sphere_seeds; i++)
+        {
+            size_t seed_i(sphere_seeds[i]);
+            size_t* attrib_i = seeds->get_tree_point_attrib(seed_i);
+            
+            // Only connect processed seeds
+            if(attrib_i[5] == 0) continue;
+
+            for (size_t j = i + 1; j < num_sphere_seeds; j++)
+            {
+                size_t seed_j(sphere_seeds[j]);
+                size_t* attrib_j = seeds->get_tree_point_attrib(seed_j);
+
+                if (attrib_i[5] == attrib_j[5])
+                {
+                    seeds->graph_connect_nodes(seed_i, seed_j);
+                }
+            }
+        }
+
+        // [Step E] Reset for global coloring
+        // We wipe the local 1/2 markers because we will re-flood globally
+        for (size_t i = 0; i < num_sphere_seeds; i++)
+        {
+            size_t seed_i(sphere_seeds[i]);
+            size_t* attrib = seeds->get_tree_point_attrib(seed_i);
+            attrib[5] = 0;
+        }
+    }
+
+    delete[] face_normal;
+    delete[] face_corners;
+
+    // 5. Global Coloring (Flooding Disjoint Subgraphs)
+    size_t region_id(0);
+    while (true)
+    {
+        bool done = true;
+        // Find a seed not yet colored
+        for (size_t iseed = 0; iseed < num_seeds; iseed++)
+        {
+            if (!seeds->tree_point_is_active(iseed)) continue;
+            size_t* attrib = seeds->get_tree_point_attrib(iseed);
+            if (attrib[5] != 0) continue;
+            region_id++; attrib[5] = region_id;
+            done = false;
+            break;
+        }
+        if (done) break;
+
+        // Flood fill from that seed
+        while (true)
+        {
+            bool subregion_done(true);
+            for (size_t iseed = 0; iseed < num_seeds; iseed++)
+            {
+                if (!seeds->tree_point_is_active(iseed)) continue;
+                size_t* attrib = seeds->get_tree_point_attrib(iseed);
+                if (attrib[5] != region_id) continue;
+
+                std::vector<size_t> neighbor_seeds;
+                seeds->graph_get_neighbors(iseed, neighbor_seeds);
+                if (neighbor_seeds.empty()) continue;
+
+                for (size_t i = 0; i < neighbor_seeds.size(); i++)
+                {
+                    size_t neighbor_seed = neighbor_seeds[i];
+                    if (!seeds->tree_point_is_active(neighbor_seed)) continue;
+
+                    size_t* neighbor_attrib = seeds->get_tree_point_attrib(neighbor_seed);
+
+                    if (neighbor_attrib[5] != 0)
+                    {
+                        if (neighbor_attrib[5] != region_id)
+                        {
+                            // This indicates a topology error or inconsistency in local orientation
+                            // But usually safe to ignore in simple reconstruction
+                        }
+                        continue;
+                    }
+                    neighbor_attrib[5] = region_id;
+                    subregion_done = false;
+                }
+            }
+            if (subregion_done) break;
+        }
+    }
+
+    size_t num_subregions = region_id;
+    std::cout << "  * Number of subregions detected: " << num_subregions << std::endl;
+
+    // 6. Export Data
+    num_seeds = seeds->get_num_tree_points();
+    seedes = new double[num_seeds * 3];
+    seeds_region_id = new size_t[num_seeds];
+    seeds_sizing = new double[num_seeds];
+
+    for (size_t iseed = 0; iseed < num_seeds; iseed++)
+    {
+        if (!seeds->tree_point_is_active(iseed)) continue;
+        double x[4];
+        seeds->get_tree_point(iseed, 4, x);
+        size_t* attrib = seeds->get_tree_point_attrib(iseed);
+        for (size_t idim = 0; idim < 3; idim++) seedes[iseed * 3 + idim] = x[idim];
         
-        if (max_face_idx >= surface_spheres->get_num_tree_points()) {
-            std::cout << "[ERROR] MISMATCH DETECTED: OBJ references vertices up to index " << max_face_idx 
-                      << ", but there are only " << surface_spheres->get_num_tree_points() << " spheres!" << std::endl;
-        }
+        // Output the calculated region ID
+        seeds_region_id[iseed] = attrib[5]; 
+        seeds_sizing[iseed] = x[3];
+    }
 
-			for (size_t iseed = 0; iseed < num_seeds; iseed++)
-			{
-				if (!seeds->tree_point_is_active(iseed)) continue;
-				size_t* attrib = seeds->get_tree_point_attrib(iseed);
-				const size_t jseed = attrib[1];
-				if (jseed >= num_seeds) continue;
-				if (iseed > jseed) continue;
-				if (!seeds->tree_point_is_active(jseed)) continue;
+    generate_seed_csv("seeds.csv", 3, num_seeds, seedes, seeds_sizing, seeds_region_id);
+}
+// void Generator::color_surface_seeds(int num_faces, MeshingTree *surface_spheres,MeshingTree *upper_seeds, MeshingTree *lower_seeds,MeshingTree *seeds,
+//         std::vector<int> face, double* &seedes, size_t* &seeds_region_id, double* &seeds_sizing)
+// {
 
-				std::array<size_t, 3> key{attrib[2], attrib[3], attrib[4]};
-				std::sort(key.begin(), key.end());
-				if (face_set.find(key) == face_set.end())
-				{
-					seeds->lazy_delete_tree_point(iseed);
-					seeds->lazy_delete_tree_point(jseed);
-				}
-			}
-		}
+// 	size_t actual_num_faces = face.size() / 3;
+//     std::cout << "[Debug] In color_surface_seeds:" << std::endl;
+//     std::cout << "  - Face vector size: " << face.size() << " (implies " << actual_num_faces << " faces)" << std::endl;
+    
+//     size_t num_upper_seeds(upper_seeds->get_num_tree_points());
+//     size_t num_lower_seeds(lower_seeds->get_num_tree_points());
+//     std::cout << "  - Upper seeds: " << num_upper_seeds << ", Lower seeds: " << num_lower_seeds << std::endl;
+
+//     // adjust id of seed pair for upper seeds
+//     for (size_t iseed = 0; iseed < num_upper_seeds; iseed++)
+//     {
+//       // copy point location, normal and attributes
+//       double x[4];
+//       upper_seeds->get_tree_point(iseed, 4, x);
+//       double* normal = upper_seeds->get_tree_point_normal(iseed);
+//       size_t* attrib = upper_seeds->get_tree_point_attrib(iseed);
+//       attrib[1] += num_upper_seeds;
+//       seeds->add_tree_point(4, x, normal, attrib);
+//     }
+//     upper_seeds->clear_memory();
+
+//     for (size_t iseed = 0; iseed < num_lower_seeds; iseed++)
+//     {
+//       // copy point location, normal and attributes
+//       double x[4];
+//       lower_seeds->get_tree_point(iseed, 4, x);
+//       double* normal = lower_seeds->get_tree_point_normal(iseed);
+//       size_t* attrib = lower_seeds->get_tree_point_attrib(iseed);
+//       seeds->add_tree_point(4, x, normal, attrib);
+//     }
+//     lower_seeds->clear_memory();
+
+//     size_t num_seeds(seeds->get_num_tree_points());
+// 		if (num_faces > 0 && !face.empty())
+// 		{
+// 			struct FaceKeyHash
+// 			{
+// 				size_t operator()(const std::array<size_t, 3>& a) const noexcept
+// 				{
+// 					size_t h = 0;
+// 					h ^= std::hash<size_t>{}(a[0]) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+// 					h ^= std::hash<size_t>{}(a[1]) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+// 					h ^= std::hash<size_t>{}(a[2]) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+// 					return h;
+// 				}
+// 			};
+
+// 			std::unordered_set<std::array<size_t, 3>, FaceKeyHash> face_set;
+// 			face_set.reserve(static_cast<size_t>(num_faces) * 2);
+// 			for (int i = 0; i < num_faces; i++)
+// 			{
+// 				size_t a = static_cast<size_t>(face[3 * i + 0]);
+// 				size_t b = static_cast<size_t>(face[3 * i + 1]);
+// 				size_t c = static_cast<size_t>(face[3 * i + 2]);
+// 				std::array<size_t, 3> key{a, b, c};
+// 				std::sort(key.begin(), key.end());
+// 				face_set.insert(key);
+// 			}
+
+// 			int max_face_idx = -1;
+//         for(int idx : face) {
+//             if(idx > max_face_idx) max_face_idx = idx;
+//         }
+//         std::cout << "[Debug] Max Vertex Index in OBJ: " << max_face_idx << std::endl;
+//         std::cout << "[Debug] Total Spheres (Seeds' source): " << surface_spheres->get_num_tree_points() << std::endl;
+        
+//         if (max_face_idx >= surface_spheres->get_num_tree_points()) {
+//             std::cout << "[ERROR] MISMATCH DETECTED: OBJ references vertices up to index " << max_face_idx 
+//                       << ", but there are only " << surface_spheres->get_num_tree_points() << " spheres!" << std::endl;
+//         }
+
+// 			for (size_t iseed = 0; iseed < num_seeds; iseed++)
+// 			{
+// 				if (!seeds->tree_point_is_active(iseed)) continue;
+// 				size_t* attrib = seeds->get_tree_point_attrib(iseed);
+// 				const size_t jseed = attrib[1];
+// 				if (jseed >= num_seeds) continue;
+// 				if (iseed > jseed) continue;
+// 				if (!seeds->tree_point_is_active(jseed)) continue;
+
+// 				std::array<size_t, 3> key{attrib[2], attrib[3], attrib[4]};
+// 				std::sort(key.begin(), key.end());
+// 				if (face_set.find(key) == face_set.end())
+// 				{
+// 					seeds->lazy_delete_tree_point(iseed);
+// 					seeds->lazy_delete_tree_point(jseed);
+// 				}
+// 			}
+// 		}
 		
 	
-	for (size_t iseed = 0; iseed < num_seeds; iseed++)
-	{
-		// Establish Sphere -> Seeds directional graph
-		if (!seeds->tree_point_is_active(iseed)) continue;
-		size_t* attrib = seeds->get_tree_point_attrib(iseed);
-		size_t si(attrib[2]), sj(attrib[3]), sk(attrib[4]);
-		surface_spheres->graph_connect(si, iseed); surface_spheres->graph_connect(sj, iseed); surface_spheres->graph_connect(sk, iseed);
-	}
+// 	for (size_t iseed = 0; iseed < num_seeds; iseed++)
+// 	{
+// 		// Establish Sphere -> Seeds directional graph
+// 		if (!seeds->tree_point_is_active(iseed)) continue;
+// 		size_t* attrib = seeds->get_tree_point_attrib(iseed);
+// 		size_t si(attrib[2]), sj(attrib[3]), sk(attrib[4]);
+// 		surface_spheres->graph_connect(si, iseed); surface_spheres->graph_connect(sj, iseed); surface_spheres->graph_connect(sk, iseed);
+// 	}
 
-	double* face_normal = new double[3];
-	double** face_corners = new double*[3];
-	size_t num_spheres(surface_spheres->get_num_tree_points());
+// 	double* face_normal = new double[3];
+// 	double** face_corners = new double*[3];
+// 	size_t num_spheres(surface_spheres->get_num_tree_points());
 
-	for (size_t isphere = 0; isphere < num_spheres; isphere++)
-	{
-		#pragma region Connect Seeds of Surface Spheres:
-		std::vector<size_t> sphere_seeds;
-		surface_spheres->graph_get_neighbors(isphere, sphere_seeds);
-		if (sphere_seeds.empty()) continue;
+// 	for (size_t isphere = 0; isphere < num_spheres; isphere++)
+// 	{
+// 		#pragma region Connect Seeds of Surface Spheres:
+// 		std::vector<size_t> sphere_seeds;
+// 		surface_spheres->graph_get_neighbors(isphere, sphere_seeds);
+// 		if (sphere_seeds.empty()) continue;
 
-		size_t num_sphere_seeds = sphere_seeds.size();
+// 		size_t num_sphere_seeds = sphere_seeds.size();
 		
-		// 1. Reset orientation attribute for all seeds on this sphere
-		for (size_t i = 0; i < num_sphere_seeds; i++)
-		{
-			size_t seed_i(sphere_seeds[i]);
-			if (!seeds->tree_point_is_active(seed_i)) continue;
-			// Check if the pair seed is also valid
-			size_t attrib_pair = 0;
-			seeds->get_tree_point_attrib(seed_i, 1, attrib_pair);
-			if (attrib_pair < num_seeds && seeds->tree_point_is_active(attrib_pair))
-			{
-				seeds->set_tree_point_attrib(seed_i, 5, static_cast<size_t>(0));
-			}
-		}
+// 		// 1. Reset orientation attribute for all seeds on this sphere
+// 		for (size_t i = 0; i < num_sphere_seeds; i++)
+// 		{
+// 			size_t seed_i(sphere_seeds[i]);
+// 			if (!seeds->tree_point_is_active(seed_i)) continue;
+// 			// Check if the pair seed is also valid
+// 			size_t attrib_pair = 0;
+// 			seeds->get_tree_point_attrib(seed_i, 1, attrib_pair);
+// 			if (attrib_pair < num_seeds && seeds->tree_point_is_active(attrib_pair))
+// 			{
+// 				seeds->set_tree_point_attrib(seed_i, 5, static_cast<size_t>(0));
+// 			}
+// 		}
 
-		// 2. Process all seeds on this sphere to propagate orientation
-		// We iterate through all seeds to ensure we handle disjoint loops on the same sphere
-		for (size_t start_idx = 0; start_idx < num_sphere_seeds; start_idx++)
-		{
-			size_t start_seed = sphere_seeds[start_idx];
-			if (!seeds->tree_point_is_active(start_seed)) continue;
+// 		// 2. Process all seeds on this sphere to propagate orientation
+// 		// We iterate through all seeds to ensure we handle disjoint loops on the same sphere
+// 		for (size_t start_idx = 0; start_idx < num_sphere_seeds; start_idx++)
+// 		{
+// 			size_t start_seed = sphere_seeds[start_idx];
+// 			if (!seeds->tree_point_is_active(start_seed)) continue;
 			
-			size_t* start_attrib = seeds->get_tree_point_attrib(start_seed);
-			if (start_attrib[5] != 0) continue; // Already processed
+// 			size_t* start_attrib = seeds->get_tree_point_attrib(start_seed);
+// 			if (start_attrib[5] != 0) continue; // Already processed
 
-			// Initialize orientation for the starting seed
-			size_t seed_2 = start_attrib[1]; // Pair seed
-			if (seed_2 >= num_seeds || !seeds->tree_point_is_active(seed_2)) continue;
+// 			// Initialize orientation for the starting seed
+// 			size_t seed_2 = start_attrib[1]; // Pair seed
+// 			if (seed_2 >= num_seeds || !seeds->tree_point_is_active(seed_2)) continue;
 
-			// Generators: isphere, sj, sk
-			size_t si = start_attrib[2];
-			size_t sj = start_attrib[3];
-			size_t sk = start_attrib[4];
+// 			// Generators: isphere, sj, sk
+// 			size_t si = start_attrib[2];
+// 			size_t sj = start_attrib[3];
+// 			size_t sk = start_attrib[4];
 			
-			// Ensure 'si' matches 'isphere'
-			if (si != isphere && sj != isphere && sk != isphere) continue; 
+// 			// Ensure 'si' matches 'isphere'
+// 			if (si != isphere && sj != isphere && sk != isphere) continue; 
 
-			// Organize indices such that si == isphere
-			// We want to walk across the edge shared with 'sj' (arbitrary choice for start)
-			size_t curr_shared = (sj == isphere) ? sk : sj; // The "other" sphere sharing the first edge
+// 			// Organize indices such that si == isphere
+// 			// We want to walk across the edge shared with 'sj' (arbitrary choice for start)
+// 			size_t curr_shared = (sj == isphere) ? sk : sj; // The "other" sphere sharing the first edge
 			
-			// Calculate geometry normal for orientation
-			double* x_1 = seeds->get_tree_point(start_seed);
-			double* x_2 = seeds->get_tree_point(seed_2);
+// 			// Calculate geometry normal for orientation
+// 			double* x_1 = seeds->get_tree_point(start_seed);
+// 			double* x_2 = seeds->get_tree_point(seed_2);
 
-			face_corners[0] = surface_spheres->get_tree_point(si);
-			face_corners[1] = surface_spheres->get_tree_point(sj);
-			face_corners[2] = surface_spheres->get_tree_point(sk);
+// 			face_corners[0] = surface_spheres->get_tree_point(si);
+// 			face_corners[1] = surface_spheres->get_tree_point(sj);
+// 			face_corners[2] = surface_spheres->get_tree_point(sk);
 
-			_geom.get_3d_triangle_normal(face_corners, face_normal);
+// 			_geom.get_3d_triangle_normal(face_corners, face_normal);
 
-			double dot(0.0);
-			for (size_t idim = 0; idim < 3; idim++) dot += (x_2[idim] - x_1[idim]) * face_normal[idim];
+// 			double dot(0.0);
+// 			for (size_t idim = 0; idim < 3; idim++) dot += (x_2[idim] - x_1[idim]) * face_normal[idim];
 
-			// Mark initial seed pair
-			if (dot > 0.0) {
-				start_attrib[5] = 1; // inside
-				seeds->set_tree_point_attrib(seed_2, 5, static_cast<size_t>(2)); // outside
-			} else {
-				start_attrib[5] = 2; // outside
-				seeds->set_tree_point_attrib(seed_2, 5, static_cast<size_t>(1)); // inside
-			}
+// 			// Mark initial seed pair
+// 			if (dot > 0.0) {
+// 				start_attrib[5] = 1; // inside
+// 				seeds->set_tree_point_attrib(seed_2, 5, static_cast<size_t>(2)); // outside
+// 			} else {
+// 				start_attrib[5] = 2; // outside
+// 				seeds->set_tree_point_attrib(seed_2, 5, static_cast<size_t>(1)); // inside
+// 			}
 
-			// 3. Walk the loop
-			size_t curr_seed = start_seed;
-			size_t safety_count = 0;
+// 			// 3. Walk the loop
+// 			size_t curr_seed = start_seed;
+// 			size_t safety_count = 0;
 			
-			// We will traverse neighbors until we come back to start or hit a dead end
-			while (true)
-			{
-				if (++safety_count > num_sphere_seeds * 2) break; // Prevent infinite loop
+// 			// We will traverse neighbors until we come back to start or hit a dead end
+// 			while (true)
+// 			{
+// 				if (++safety_count > num_sphere_seeds * 2) break; // Prevent infinite loop
 
-				// We are at 'curr_seed', looking for a neighbor that shares 'isphere' and 'curr_shared'
-				// and has NOT been visited (attrib[5] == 0).
+// 				// We are at 'curr_seed', looking for a neighbor that shares 'isphere' and 'curr_shared'
+// 				// and has NOT been visited (attrib[5] == 0).
 				
-				bool found_next = false;
-				for (size_t k = 0; k < num_sphere_seeds; k++)
-				{
-					size_t next_seed = sphere_seeds[k];
-					if (next_seed == curr_seed) continue;
-					if (!seeds->tree_point_is_active(next_seed)) continue;
+// 				bool found_next = false;
+// 				for (size_t k = 0; k < num_sphere_seeds; k++)
+// 				{
+// 					size_t next_seed = sphere_seeds[k];
+// 					if (next_seed == curr_seed) continue;
+// 					if (!seeds->tree_point_is_active(next_seed)) continue;
 
-					size_t* next_attrib = seeds->get_tree_point_attrib(next_seed);
-					// Note: In standard closed loops, we stop if visited. 
-					// But the last step needs to connect back to start, so checking 0 might stop us one step early. 
-					// However, for orientation propagation, stopping at visited is fine.
-					if (next_attrib[5] != 0) continue; 
+// 					size_t* next_attrib = seeds->get_tree_point_attrib(next_seed);
+// 					// Note: In standard closed loops, we stop if visited. 
+// 					// But the last step needs to connect back to start, so checking 0 might stop us one step early. 
+// 					// However, for orientation propagation, stopping at visited is fine.
+// 					if (next_attrib[5] != 0) continue; 
 
-					// Check if next_seed shares 'isphere' (guaranteed by loop) and 'curr_shared'
-					bool shares_edge = (next_attrib[2] == curr_shared || next_attrib[3] == curr_shared || next_attrib[4] == curr_shared);
+// 					// Check if next_seed shares 'isphere' (guaranteed by loop) and 'curr_shared'
+// 					bool shares_edge = (next_attrib[2] == curr_shared || next_attrib[3] == curr_shared || next_attrib[4] == curr_shared);
 					
-					if (shares_edge)
-					{
-						// Found the neighbor!
-						// Propagate orientation
-						size_t next_pair = next_attrib[1];
+// 					if (shares_edge)
+// 					{
+// 						// Found the neighbor!
+// 						// Propagate orientation
+// 						size_t next_pair = next_attrib[1];
 						
-						// Geometry check
-						// We need to orient 'next_seed' relative to 'curr_seed'.
-						// Since they share an edge on the sphere, they generally flip orientation relative to the triplet normal?
-						// Actually, simpler: calculate dot product again for the new triplet.
+// 						// Geometry check
+// 						// We need to orient 'next_seed' relative to 'curr_seed'.
+// 						// Since they share an edge on the sphere, they generally flip orientation relative to the triplet normal?
+// 						// Actually, simpler: calculate dot product again for the new triplet.
 						
-						size_t n_si = next_attrib[2]; 
-						size_t n_sj = next_attrib[3]; 
-						size_t n_sk = next_attrib[4];
+// 						size_t n_si = next_attrib[2]; 
+// 						size_t n_sj = next_attrib[3]; 
+// 						size_t n_sk = next_attrib[4];
 						
-						face_corners[0] = surface_spheres->get_tree_point(n_si);
-						face_corners[1] = surface_spheres->get_tree_point(n_sj);
-						face_corners[2] = surface_spheres->get_tree_point(n_sk);
-						_geom.get_3d_triangle_normal(face_corners, face_normal);
+// 						face_corners[0] = surface_spheres->get_tree_point(n_si);
+// 						face_corners[1] = surface_spheres->get_tree_point(n_sj);
+// 						face_corners[2] = surface_spheres->get_tree_point(n_sk);
+// 						_geom.get_3d_triangle_normal(face_corners, face_normal);
 						
-						double* nx_1 = seeds->get_tree_point(next_seed);
-						double* nx_2 = seeds->get_tree_point(next_pair);
+// 						double* nx_1 = seeds->get_tree_point(next_seed);
+// 						double* nx_2 = seeds->get_tree_point(next_pair);
 						
-						double ndot = 0.0;
-						for (size_t idim = 0; idim < 3; idim++) ndot += (nx_2[idim] - nx_1[idim]) * face_normal[idim];
+// 						double ndot = 0.0;
+// 						for (size_t idim = 0; idim < 3; idim++) ndot += (nx_2[idim] - nx_1[idim]) * face_normal[idim];
 						
-						if (ndot > 0.0) {
-							next_attrib[5] = 1; 
-							seeds->set_tree_point_attrib(next_pair, 5, static_cast<size_t>(2));
-						} else {
-							next_attrib[5] = 2; 
-							seeds->set_tree_point_attrib(next_pair, 5, static_cast<size_t>(1));
-						}
+// 						if (ndot > 0.0) {
+// 							next_attrib[5] = 1; 
+// 							seeds->set_tree_point_attrib(next_pair, 5, static_cast<size_t>(2));
+// 						} else {
+// 							next_attrib[5] = 2; 
+// 							seeds->set_tree_point_attrib(next_pair, 5, static_cast<size_t>(1));
+// 						}
 
-						// Advance
-						// Determine the *other* shared sphere for the next step
-						// The triplet is (isphere, curr_shared, NEW_SPHERE)
-						// The shared edge for the *next* step will be (isphere, NEW_SPHERE)
-						size_t new_shared = 0;
-						if (n_si != isphere && n_si != curr_shared) new_shared = n_si;
-						else if (n_sj != isphere && n_sj != curr_shared) new_shared = n_sj;
-						else new_shared = n_sk;
+// 						// Advance
+// 						// Determine the *other* shared sphere for the next step
+// 						// The triplet is (isphere, curr_shared, NEW_SPHERE)
+// 						// The shared edge for the *next* step will be (isphere, NEW_SPHERE)
+// 						size_t new_shared = 0;
+// 						if (n_si != isphere && n_si != curr_shared) new_shared = n_si;
+// 						else if (n_sj != isphere && n_sj != curr_shared) new_shared = n_sj;
+// 						else new_shared = n_sk;
 
-						curr_shared = new_shared;
-						curr_seed = next_seed;
-						found_next = true;
-						break;
-					}
-				}
-				if (!found_next) break; // End of chain
-			}
-		}
+// 						curr_shared = new_shared;
+// 						curr_seed = next_seed;
+// 						found_next = true;
+// 						break;
+// 					}
+// 				}
+// 				if (!found_next) break; // End of chain
+// 			}
+// 		}
 
-		// 4. Connect Sphere seeds based on matching orientation
-		for (size_t i = 0; i < num_sphere_seeds; i++)
-		{
-			size_t seed_i(sphere_seeds[i]);
-			if (!seeds->tree_point_is_active(seed_i)) continue;
-			size_t* attrib_i = seeds->get_tree_point_attrib(seed_i);
+// 		// 4. Connect Sphere seeds based on matching orientation
+// 		for (size_t i = 0; i < num_sphere_seeds; i++)
+// 		{
+// 			size_t seed_i(sphere_seeds[i]);
+// 			if (!seeds->tree_point_is_active(seed_i)) continue;
+// 			size_t* attrib_i = seeds->get_tree_point_attrib(seed_i);
 			
-			if (attrib_i[5] == 0) continue; // Unmarked seed, skip
+// 			if (attrib_i[5] == 0) continue; // Unmarked seed, skip
 
-			for (size_t j = i + 1; j < num_sphere_seeds; j++)
-			{
-				size_t seed_j(sphere_seeds[j]);
-				if (!seeds->tree_point_is_active(seed_j)) continue;
-				size_t* attrib_j = seeds->get_tree_point_attrib(seed_j);
+// 			for (size_t j = i + 1; j < num_sphere_seeds; j++)
+// 			{
+// 				size_t seed_j(sphere_seeds[j]);
+// 				if (!seeds->tree_point_is_active(seed_j)) continue;
+// 				size_t* attrib_j = seeds->get_tree_point_attrib(seed_j);
 
-				if (attrib_i[5] == attrib_j[5])
-				{
-					seeds->graph_connect_nodes(seed_i, seed_j);
-				}
-			}
-		}
+// 				if (attrib_i[5] == attrib_j[5])
+// 				{
+// 					seeds->graph_connect_nodes(seed_i, seed_j);
+// 				}
+// 			}
+// 		}
 
-		// 5. Reset attribute 5 to 0 for next phase (Coloring)
-		// IMPORTANT: The graph connections are persistent, but we must reset this tag
-		// because the coloring algorithm uses it as a visited flag (region_id).
-		for (size_t i = 0; i < num_sphere_seeds; i++)
-		{
-			size_t seed_i(sphere_seeds[i]);
-			if (!seeds->tree_point_is_active(seed_i)) continue;
-			seeds->set_tree_point_attrib(seed_i, 5, static_cast<size_t>(0));
-		}
-		#pragma endregion
-	}
+// 		// 5. Reset attribute 5 to 0 for next phase (Coloring)
+// 		// IMPORTANT: The graph connections are persistent, but we must reset this tag
+// 		// because the coloring algorithm uses it as a visited flag (region_id).
+// 		for (size_t i = 0; i < num_sphere_seeds; i++)
+// 		{
+// 			size_t seed_i(sphere_seeds[i]);
+// 			if (!seeds->tree_point_is_active(seed_i)) continue;
+// 			seeds->set_tree_point_attrib(seed_i, 5, static_cast<size_t>(0));
+// 		}
+// 		#pragma endregion
+// 	}
 
-	delete[] face_normal;
-	delete[] face_corners;
+// 	delete[] face_normal;
+// 	delete[] face_corners;
 
-	// // Coloring Disjoint Subgraphs
-	// size_t region_id(0);
-	// while (true)
-	// {
-	// 	bool done = true;
-	// 	for (size_t iseed = 0; iseed < num_seeds; iseed++)
-	// 	{
-	// 		if (!seeds->tree_point_is_active(iseed)) continue;
-	// 		size_t* attrib = seeds->get_tree_point_attrib(iseed);
-	// 		if (attrib[5] != 0) continue;
-	// 		region_id++; attrib[5] = region_id;
-	// 		done = false;
-	// 		break;
-	// 	}
-	// 	if (done) break;
+// 	// // Coloring Disjoint Subgraphs
+// 	// size_t region_id(0);
+// 	// while (true)
+// 	// {
+// 	// 	bool done = true;
+// 	// 	for (size_t iseed = 0; iseed < num_seeds; iseed++)
+// 	// 	{
+// 	// 		if (!seeds->tree_point_is_active(iseed)) continue;
+// 	// 		size_t* attrib = seeds->get_tree_point_attrib(iseed);
+// 	// 		if (attrib[5] != 0) continue;
+// 	// 		region_id++; attrib[5] = region_id;
+// 	// 		done = false;
+// 	// 		break;
+// 	// 	}
+// 	// 	if (done) break;
 
-	// 	while (true)
-	// 	{
-	// 		// Flooding Subregion
-	// 		bool subregion_done(true);
-	// 		for (size_t iseed = 0; iseed < num_seeds; iseed++)
-	// 		{
-	// 			if (!seeds->tree_point_is_active(iseed)) continue;
-	// 			size_t* attrib = seeds->get_tree_point_attrib(iseed);
-	// 			if (attrib[5] != region_id) continue;
+// 	// 	while (true)
+// 	// 	{
+// 	// 		// Flooding Subregion
+// 	// 		bool subregion_done(true);
+// 	// 		for (size_t iseed = 0; iseed < num_seeds; iseed++)
+// 	// 		{
+// 	// 			if (!seeds->tree_point_is_active(iseed)) continue;
+// 	// 			size_t* attrib = seeds->get_tree_point_attrib(iseed);
+// 	// 			if (attrib[5] != region_id) continue;
 
-	// 			std::vector<size_t> neighbor_seeds;
-	// 			seeds->graph_get_neighbors(iseed, neighbor_seeds);
-	// 			if (neighbor_seeds.empty()) continue;
+// 	// 			std::vector<size_t> neighbor_seeds;
+// 	// 			seeds->graph_get_neighbors(iseed, neighbor_seeds);
+// 	// 			if (neighbor_seeds.empty()) continue;
 
-	// 			for (size_t i = 0; i < neighbor_seeds.size(); i++)
-	// 			{
-	// 				size_t neighbor_seed = neighbor_seeds[i];
-	// 				if (!seeds->tree_point_is_active(neighbor_seed)) continue;
+// 	// 			for (size_t i = 0; i < neighbor_seeds.size(); i++)
+// 	// 			{
+// 	// 				size_t neighbor_seed = neighbor_seeds[i];
+// 	// 				if (!seeds->tree_point_is_active(neighbor_seed)) continue;
 
-	// 				size_t* neighbor_attrib = seeds->get_tree_point_attrib(neighbor_seed);
+// 	// 				size_t* neighbor_attrib = seeds->get_tree_point_attrib(neighbor_seed);
 
-	// 				if (neighbor_attrib[5] != 0)
-	// 				{
-	// 					if (neighbor_attrib[5] != region_id)
-	// 					{
-	// 						std::cout << "Error::Invalid coloring!!!" << std::endl;
-	// 					}
-	// 					continue;
-	// 				}
-	// 				neighbor_attrib[5] = region_id;
-	// 				subregion_done = false;
-	// 			}
-	// 		}
-	// 		if (subregion_done) break;
-	// 	}
-	// }
-	// size_t num_subregions = region_id > 0 ? region_id - 1 : 0;
+// 	// 				if (neighbor_attrib[5] != 0)
+// 	// 				{
+// 	// 					if (neighbor_attrib[5] != region_id)
+// 	// 					{
+// 	// 						std::cout << "Error::Invalid coloring!!!" << std::endl;
+// 	// 					}
+// 	// 					continue;
+// 	// 				}
+// 	// 				neighbor_attrib[5] = region_id;
+// 	// 				subregion_done = false;
+// 	// 			}
+// 	// 		}
+// 	// 		if (subregion_done) break;
+// 	// 	}
+// 	// }
+// 	// size_t num_subregions = region_id > 0 ? region_id - 1 : 0;
 
-	// // Marking ghost seeds
-	// if (num_seeds > 0)
-	// {
-	// 	double xmin[3], xmax[3];
-	// 	for (size_t idim = 0; idim < 3; idim++) xmin[idim] = DBL_MAX;
-	// 	for (size_t idim = 0; idim < 3; idim++) xmax[idim] = -DBL_MAX;
+// 	// // Marking ghost seeds
+// 	// if (num_seeds > 0)
+// 	// {
+// 	// 	double xmin[3], xmax[3];
+// 	// 	for (size_t idim = 0; idim < 3; idim++) xmin[idim] = DBL_MAX;
+// 	// 	for (size_t idim = 0; idim < 3; idim++) xmax[idim] = -DBL_MAX;
 
-	// 	for (size_t iseed = 0; iseed < num_seeds; iseed++)
-	// 	{
-	// 		if (!seeds->tree_point_is_active(iseed)) continue;
-	// 		double* xseed = seeds->get_tree_point(iseed);
-	// 		for (size_t idim = 0; idim < 3; idim++)
-	// 		{
-	// 			if (xseed[idim] < xmin[idim]) xmin[idim] = xseed[idim];
-	// 			if (xseed[idim] > xmax[idim]) xmax[idim] = xseed[idim];
-	// 		}
-	// 	}
-	// 	double xfar[3];
-	// 	for (size_t idim = 0; idim < 3; idim++) xfar[idim] = xmax[idim] + 2.0 * (xmax[idim] - xmin[idim]);
+// 	// 	for (size_t iseed = 0; iseed < num_seeds; iseed++)
+// 	// 	{
+// 	// 		if (!seeds->tree_point_is_active(iseed)) continue;
+// 	// 		double* xseed = seeds->get_tree_point(iseed);
+// 	// 		for (size_t idim = 0; idim < 3; idim++)
+// 	// 		{
+// 	// 			if (xseed[idim] < xmin[idim]) xmin[idim] = xseed[idim];
+// 	// 			if (xseed[idim] > xmax[idim]) xmax[idim] = xseed[idim];
+// 	// 		}
+// 	// 	}
+// 	// 	double xfar[3];
+// 	// 	for (size_t idim = 0; idim < 3; idim++) xfar[idim] = xmax[idim] + 2.0 * (xmax[idim] - xmin[idim]);
 
-	// 	size_t iclosest(0); double hclosest(DBL_MAX);
-	// 	seeds->get_closest_tree_point(xfar, iclosest, hclosest);
+// 	// 	size_t iclosest(0); double hclosest(DBL_MAX);
+// 	// 	seeds->get_closest_tree_point(xfar, iclosest, hclosest);
 
-	// 	size_t* attrib = seeds->get_tree_point_attrib(iclosest);
-	// 	size_t ghost_region_id = attrib[5];
+// 	// 	size_t* attrib = seeds->get_tree_point_attrib(iclosest);
+// 	// 	size_t ghost_region_id = attrib[5];
 
-	// 	// Mark ghost region as 0, shift other region IDs down
-	// 	for (size_t iseed = 0; iseed < num_seeds; iseed++)
-	// 	{
-	// 		if (!seeds->tree_point_is_active(iseed)) continue;
-	// 		size_t* attrib = seeds->get_tree_point_attrib(iseed);
-	// 		if (attrib[5] == ghost_region_id) attrib[5] = 0;
-	// 	}
-	// 	for (size_t iseed = 0; iseed < num_seeds; iseed++)
-	// 	{
-	// 		if (!seeds->tree_point_is_active(iseed)) continue;
-	// 		size_t* attrib = seeds->get_tree_point_attrib(iseed);
-	// 		if (attrib[5] > ghost_region_id) attrib[5]--;
-	// 	}
-	// }
+// 	// 	// Mark ghost region as 0, shift other region IDs down
+// 	// 	for (size_t iseed = 0; iseed < num_seeds; iseed++)
+// 	// 	{
+// 	// 		if (!seeds->tree_point_is_active(iseed)) continue;
+// 	// 		size_t* attrib = seeds->get_tree_point_attrib(iseed);
+// 	// 		if (attrib[5] == ghost_region_id) attrib[5] = 0;
+// 	// 	}
+// 	// 	for (size_t iseed = 0; iseed < num_seeds; iseed++)
+// 	// 	{
+// 	// 		if (!seeds->tree_point_is_active(iseed)) continue;
+// 	// 		size_t* attrib = seeds->get_tree_point_attrib(iseed);
+// 	// 		if (attrib[5] > ghost_region_id) attrib[5]--;
+// 	// 	}
+// 	// }
 
-	// std::cout << "  * Number of subregions is " << num_subregions << std::endl;
+// 	// std::cout << "  * Number of subregions is " << num_subregions << std::endl;
 
-	num_seeds = seeds->get_num_tree_points();
-	seedes = new double[num_seeds * 3];
-	seeds_region_id = new size_t[num_seeds];
-	seeds_sizing = new double[num_seeds];
+// 	num_seeds = seeds->get_num_tree_points();
+// 	seedes = new double[num_seeds * 3];
+// 	seeds_region_id = new size_t[num_seeds];
+// 	seeds_sizing = new double[num_seeds];
 
-	for (size_t iseed = 0; iseed < num_seeds; iseed++)
-	{
-		if(!seeds->tree_point_is_active(iseed))continue;
-		double x[4];
-		seeds->get_tree_point(iseed, 4, x);
-		size_t* attrib = seeds->get_tree_point_attrib(iseed);
-		for (size_t idim = 0; idim < 3; idim++) seedes[iseed * 3 + idim] = x[idim];
-		seeds_region_id[iseed] = attrib[5];
-		seeds_sizing[iseed] = x[3];
-	}
+// 	for (size_t iseed = 0; iseed < num_seeds; iseed++)
+// 	{
+// 		if(!seeds->tree_point_is_active(iseed))continue;
+// 		double x[4];
+// 		seeds->get_tree_point(iseed, 4, x);
+// 		size_t* attrib = seeds->get_tree_point_attrib(iseed);
+// 		for (size_t idim = 0; idim < 3; idim++) seedes[iseed * 3 + idim] = x[idim];
+// 		seeds_region_id[iseed] = attrib[5];
+// 		seeds_sizing[iseed] = x[3];
+// 	}
 
-   generate_seed_csv("seeds.csv", 3, num_seeds, seedes, seeds_sizing, seeds_region_id);
-}
+//    generate_seed_csv("seeds.csv", 3, num_seeds, seedes, seeds_sizing, seeds_region_id);
+// }
 	
 
 void Generator::generate_seed_csv(const char* filename, int num_dim, size_t num_seeds, double* spheres, double* spheres_sizing, size_t* spheres_region_id)

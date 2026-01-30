@@ -16,7 +16,7 @@ int main()
     size_t num_points, num_faces, num_faces1;
     generator.read_input_obj_file("./data/obj/mobius1.obj",num_points,points,num_faces,faces);
     generator.generate_spheres("./data/spheres/Sphere_2500_55.csv", spheres);
-    generator.read_obj_faces("./data/obj/Ours_2500_mobius1_Remesh.obj",face_flat, num_faces1);
+    generator.read_obj_faces("./data/obj/Ours_2500_mobius_Remesh.obj",face_flat, num_faces1);
     generator.generate_surface_seeds(num_points, points, num_faces, faces,
          spheres, upper_seeds, lower_seeds);
     generator.color_surface_seeds(num_faces1, spheres,upper_seeds, lower_seeds, seeds,
