@@ -73,8 +73,16 @@ void Generator::generate_surface_mesh(MeshingTree* seeds, const char* output_fil
 		
 		do {
 			if (!dt.is_infinite(cc)) {
-				Point_3 circumcenter = dt.dual(cc);
-				facet_vertices.push_back(circumcenter);
+				// Compute circumcenter manually
+				Point_3 p0 = cc->vertex(0)->point();
+				Point_3 p1 = cc->vertex(1)->point();
+				Point_3 p2 = cc->vertex(2)->point();
+				Point_3 p3 = cc->vertex(3)->point();
+				
+				// Use CGAL's circumcenter function from the kernel
+				K::Construct_circumcenter_3 circumcenter = K().construct_circumcenter_3_object();
+				Point_3 center = circumcenter(p0, p1, p2, p3);
+				facet_vertices.push_back(center);
 			}
 			++cc;
 		} while (cc != done);
