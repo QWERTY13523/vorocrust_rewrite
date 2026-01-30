@@ -51,3 +51,44 @@ int Methods::get_overlapping_spheres(double* sphere, MeshingTree* spheres,
 	return 0;
 	#pragma endregion
 }
+
+bool Methods::point_covered(double* point, MeshingTree* spheres, double alpha_coverage, size_t si, size_t sj, size_t sk,
+	                         size_t &num_covering_spheres, size_t& cap_covering_spheres, size_t* &covering_spheres)
+{
+	#pragma region Point Cover Check:
+	if (spheres->get_num_tree_points() == 0) return false;
+
+	double beta = sqrt(1.0 - alpha_coverage * alpha_coverage);
+
+	size_t closest_sphere; double closest_dst(DBL_MAX);
+	spheres->get_closest_tree_point(point, closest_sphere, closest_dst);
+
+	double closest_sphere_radius = spheres->get_tree_point_attrib(closest_sphere, 0);
+
+	double estimated_face_center_radius = closest_sphere_radius + closest_dst;
+
+	size_t num(0), cap(100);
+	size_t* neighbor_spheres = new size_t[cap];
+	double R = estimated_face_center_radius * 10;
+	spheres->get_tree_points_in_sphere(point, R, num, neighbor_spheres, cap);
+
+	bool covered(false);
+	double* sphere = new double[4];
+	for (size_t i = 0; i < num; i++)
+	{
+		size_t isphere = neighbor_spheres[i];
+		if (isphere == si || isphere == sj || isphere == sk) continue;
+		spheres->get_tree_point(isphere, 4, sphere);
+
+		double h = _geom.distance(3, point, sphere);
+		if (h < beta * sphere[3] + 1E-10)
+		{
+			covered = true;
+		}
+	}
+
+	delete[] sphere; delete[] neighbor_spheres;
+
+	return covered;
+	#pragma endregion
+}
