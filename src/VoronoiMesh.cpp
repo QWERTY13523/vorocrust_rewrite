@@ -2,11 +2,11 @@
 #include <map>
 
 #ifdef USE_CGAL
-#include <CGAL/Exact_predicates_inexact_constructions_kernel.h>
+#include <CGAL/Exact_predicates_exact_constructions_kernel.h>
 #include <CGAL/Delaunay_triangulation_3.h>
 #include <CGAL/Triangulation_vertex_base_with_info_3.h>
 
-typedef CGAL::Exact_predicates_inexact_constructions_kernel K;
+typedef CGAL::Exact_predicates_exact_constructions_kernel K;
 typedef CGAL::Triangulation_vertex_base_with_info_3<size_t, K> Vb;
 typedef CGAL::Triangulation_data_structure_3<Vb> Tds;
 typedef CGAL::Delaunay_triangulation_3<K, Tds> Delaunay;
@@ -111,9 +111,9 @@ void Generator::generate_surface_mesh(MeshingTree* seeds, const char* output_fil
 	
 	auto get_vertex_index = [&](const Point_3& p) -> size_t {
 		// Round to avoid floating point precision issues
-		double x = std::round(p.x() * 1e10) / 1e10;
-		double y = std::round(p.y() * 1e10) / 1e10;
-		double z = std::round(p.z() * 1e10) / 1e10;
+		double x = std::round(CGAL::to_double(p.x()) * 1e10) / 1e10;
+        double y = std::round(CGAL::to_double(p.y()) * 1e10) / 1e10;
+        double z = std::round(CGAL::to_double(p.z()) * 1e10) / 1e10;
 		auto key = std::make_tuple(x, y, z);
 		
 		auto it = vertex_map.find(key);
@@ -128,22 +128,34 @@ void Generator::generate_surface_mesh(MeshingTree* seeds, const char* output_fil
 	
 	// Process facets and triangulate polygons
 	for (const auto& facet : voronoi_facets) {
-		if (facet.size() < 3) continue;
-		
-		std::vector<size_t> indices;
-		for (const auto& pt : facet) {
-			indices.push_back(get_vertex_index(pt));
-		}
-		
-		// Fan triangulation for polygon with more than 3 vertices
-		for (size_t i = 1; i + 1 < indices.size(); i++) {
-			face_indices.push_back({indices[0], indices[i], indices[i + 1]});
-		}
-	}
+        if (facet.size() < 3) continue;
+        
+        std::vector<size_t> indices;
+        for (const auto& pt : facet) {
+            indices.push_back(get_vertex_index(pt));
+        }
+        
+        // Fan triangulation for polygon with more than 3 vertices
+        for (size_t i = 1; i + 1 < indices.size(); i++) {
+            size_t idx0 = indices[0];
+            size_t idx1 = indices[i];
+            size_t idx2 = indices[i + 1];
+
+            // 【修复关键】：检查并跳过退化三角形（任意两个顶点索引相同）
+            if (idx0 == idx1 || idx0 == idx2 || idx1 == idx2) {
+                continue;
+            }
+
+            face_indices.push_back({idx0, idx1, idx2});
+        }
+    }
 	
 	// Write vertices
 	for (const auto& v : unique_vertices) {
-		obj_file << "v " << std::setprecision(16) << v.x() << " " << v.y() << " " << v.z() << std::endl;
+		obj_file << "v " << std::setprecision(16) 
+                 << CGAL::to_double(v.x()) << " " 
+                 << CGAL::to_double(v.y()) << " " 
+                 << CGAL::to_double(v.z()) << std::endl;
 	}
 	
 	// Write faces (OBJ uses 1-based indexing)

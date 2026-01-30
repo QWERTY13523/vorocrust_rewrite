@@ -683,9 +683,10 @@ int MeshingTree::lazy_delete_tree_point_internal(size_t point_index)
  
 int MeshingTree::lazy_delete_tree_rebuild_if_needed()
 {
-    if (!_marked_only) return 0;
-    if (_lazy_deleted_since_rebuild < _lazy_delete_rebuild_threshold) return 0;
-    return lazy_delete_tree_rebuild_compact();
+    // if (!_marked_only) return 0;
+    // if (_lazy_deleted_since_rebuild < _lazy_delete_rebuild_threshold) return 0;
+    // return lazy_delete_tree_rebuild_compact();
+	return 0;
 }
  
 int MeshingTree::lazy_delete_tree_rebuild_compact()
