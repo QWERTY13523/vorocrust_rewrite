@@ -130,11 +130,11 @@ int MeshingTree::set_tree_point_attrib(size_t point_index, size_t attrib_index, 
 	return 0;
 }
 
-int MeshingTree::set_tree_point_attrib(size_t point_index, size_t attrib_index, double attrib)
-{
-	_points[point_index][_num_dim + attrib_index] = attrib;
-	return 0;
-}
+// int MeshingTree::set_tree_point_attrib(size_t point_index, size_t attrib_index, double attrib)
+// {
+// 	_points[point_index][_num_dim + attrib_index] = attrib;
+// 	return 0;
+// }
 
 void MeshingTree::clear_memory()
 {
