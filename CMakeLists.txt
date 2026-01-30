@@ -7,6 +7,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 option(USE_CGAL "Enable CGAL" OFF)
 
+# Configure vcpkg
+set(CMAKE_TOOLCHAIN_FILE "/home/yiming/.vcpkg-clion/vcpkg/scripts/buildsystems/vcpkg.cmake"
+    CACHE STRING "Vcpkg toolchain file")
+
 find_package(Eigen3 REQUIRED)
 
 if (USE_CGAL)
@@ -26,5 +30,6 @@ target_include_directories(vorocrust PRIVATE
 target_link_libraries(vorocrust PRIVATE Eigen3::Eigen)
 
 if (USE_CGAL)
+  target_compile_definitions(vorocrust PRIVATE USE_CGAL)
   target_link_libraries(vorocrust PRIVATE CGAL::CGAL)
 endif()

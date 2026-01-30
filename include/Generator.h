@@ -34,7 +34,7 @@ public:
         size_t* &seeds_region_id, 
         double* &seeds_sizing
     );
-    //void generate_surface_mesh(size_t num_seeds, double *seeds, size_t *seeds_region_id, double *seeds_sizing);
+    void generate_surface_mesh(MeshingTree* seeds, const char* output_filename);
     void generate_seed_csv(
         const char* filename, 
         int num_dim, 

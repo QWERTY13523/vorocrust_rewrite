@@ -22,4 +22,5 @@ int main()
     generator.color_surface_seeds(num_faces1, spheres,upper_seeds, lower_seeds, seeds,
         face_flat, seedes, seeds_region_id, seeds_sizing);
     //generator.generate_seed_csv("seeds.csv",3,seeds->get_num_tree_points(),seedes, seeds_sizing, seeds_region_id);
+    generator.generate_surface_mesh(seeds, "surface_mesh.obj");
 }
