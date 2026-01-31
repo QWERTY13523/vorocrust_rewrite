@@ -252,6 +252,14 @@ void Generator::read_obj_faces(const char* filename, std::vector<int>& faces_fla
 void Generator::generate_surface_seeds(size_t num_points, double **points, size_t num_faces, size_t **faces,
          MeshingTree *spheres,MeshingTree *upper_seeds, MeshingTree *lower_seeds)
 {
+    // Initialize sliver points OBJ file
+    std::ofstream sliver_file("sliver_points.obj", std::ios::out);
+    if (sliver_file.is_open()) {
+        sliver_file << "# Sliver points detected by VoroCrust" << std::endl;
+        sliver_file << "# Format: v x y z r g b (r=1.0 for upper seeds, b=1.0 for lower seeds)" << std::endl;
+        sliver_file.close();
+    }
+    
     size_t num_spheres = spheres->get_num_tree_points();
     double* sphere = new double[4];
 
@@ -347,19 +355,7 @@ void Generator::generate_surface_seeds(size_t num_points, double **points, size_
                 delete[] fi_normal; delete[] fi_corners;
                 
                 // Check for sliver detection
-                size_t num = 0, cap = 100;
-                size_t* covering_spheres = new size_t[cap];
-                bool upper_covered = _methods.point_covered(upper_seed, spheres, 0.0, sphere_index_i, sphere_index_j, sphere_index_k, num, cap, covering_spheres);
-                num = 0; // Reset for lower check
-                bool lower_covered = _methods.point_covered(lower_seed, spheres, 0.0, sphere_index_i, sphere_index_j, sphere_index_k, num, cap, covering_spheres);
-                delete[] covering_spheres;
-                
-				if(upper_covered && lower_covered)
-					continue;
-                if(upper_covered != lower_covered)
-                {
-                    std::cout << "Sliver! caused by spheres " << isphere << " " << jsphere << " " << ksphere << std::endl;
-                }
+               
                 if (dot < 0.0)
                 {
                   attrib[2] = sphere_index_i;
@@ -380,6 +376,66 @@ void Generator::generate_surface_seeds(size_t num_points, double **points, size_
                   lower_seed[idim] = c_ijk[idim] - vi * triplet_normal[idim];
                 }
 
+				size_t num1 = 0, num2 = 0, cap = 100;
+                size_t* covering_spheres1 = new size_t[cap],*covering_spheres2 = new size_t[cap];
+                bool upper_covered = _methods.point_covered(upper_seed, spheres, 0.0, sphere_index_i, sphere_index_j, sphere_index_k, num1, cap, covering_spheres1);
+                bool lower_covered = _methods.point_covered(lower_seed, spheres, 0.0, sphere_index_i, sphere_index_j, sphere_index_k, num2, cap, covering_spheres2);
+				delete[] covering_spheres1;delete[] covering_spheres2;
+                if(upper_covered && lower_covered)continue;
+                if(upper_covered != lower_covered)
+                {
+                    std::cout << "Sliver! caused by spheres " << sphere_index_i << " " << sphere_index_j << " " << sphere_index_k << std::endl;
+                    for(int i=0;i<3;i++)
+                    {
+                        std::cout<<upper_seed[i]<<" ";
+                    }
+                    std::cout<<std::endl;
+                    for(int i=0;i<3;i++)
+                    {
+                        std::cout<<lower_seed[i]<<" ";
+                    }
+                    std::cout<<std::endl;
+                    
+                    // Get sphere centers for the three spheres causing the sliver
+                    double sphere_i_center[4], sphere_j_center[4], sphere_k_center[4];
+                    spheres->get_tree_point(sphere_index_i, 4, sphere_i_center);
+                    spheres->get_tree_point(sphere_index_j, 4, sphere_j_center);
+                    spheres->get_tree_point(sphere_index_k, 4, sphere_k_center);
+                    
+                    // Output sliver points and sphere centers to OBJ file
+                    std::ofstream sliver_file("sliver_points.obj", std::ios::app);
+                    if (sliver_file.is_open()) {
+                        // Write upper seed point (red)
+                        sliver_file << "v " << upper_seed[0] << " " << upper_seed[1] << " " << upper_seed[2] << " 1.0 0.0 0.0" << std::endl;
+                        // Write lower seed point (blue)
+                        sliver_file << "v " << lower_seed[0] << " " << lower_seed[1] << " " << lower_seed[2] << " 0.0 0.0 1.0" << std::endl;
+                        // Write sphere centers (green)
+                        sliver_file << "v " << sphere_i_center[0] << " " << sphere_i_center[1] << " " << sphere_i_center[2] << " 0.0 1.0 0.0" << std::endl;
+                        sliver_file << "v " << sphere_j_center[0] << " " << sphere_j_center[1] << " " << sphere_j_center[2] << " 0.0 1.0 0.0" << std::endl;
+                        sliver_file << "v " << sphere_k_center[0] << " " << sphere_k_center[1] << " " << sphere_k_center[2] << " 0.0 1.0 0.0" << std::endl;
+                        
+                        // Write triangle formed by the three sphere centers (yellow)
+                        // Get current vertex count for face indexing
+                        static int vertex_count = 0;
+                        if (vertex_count == 0) {
+                            // Count existing vertices in file
+                            std::ifstream count_file("sliver_points.obj");
+                            std::string line;
+                            while (std::getline(count_file, line)) {
+                                if (line.substr(0, 2) == "v ") {
+                                    vertex_count++;
+                                }
+                            }
+                            count_file.close();
+                        }
+                        
+                        // Write triangle face using the last 3 vertices (sphere centers)
+                        sliver_file << "f " << (vertex_count - 2) << " " << (vertex_count - 1) << " " << vertex_count << std::endl;
+                        vertex_count += 5; // 2 seed points + 3 sphere centers
+                        
+                        sliver_file.close();
+                    }
+                }
                 #pragma region A valid Intersection Pairs:
                 size_t iclosest; double hclosest(DBL_MAX);
                 size_t upper_seed_index(upper_seeds->get_num_tree_points());
@@ -502,7 +558,7 @@ void Generator::generate_surface_seeds(size_t num_points, double **points, size_
 }
 
 void Generator::color_surface_seeds(int num_faces, MeshingTree *surface_spheres, MeshingTree *upper_seeds, MeshingTree *lower_seeds, MeshingTree *seeds,
-    std::vector<int> face, double* &seedes, size_t* &seeds_region_id, double* &seeds_sizing)
+    std::vector<int> face, double** points, double* &seedes, size_t* &seeds_region_id, double* &seeds_sizing)
 {
     std::cout << "[Info] Starting robust color_surface_seeds..." << std::endl;
 
@@ -569,7 +625,10 @@ void Generator::color_surface_seeds(int num_faces, MeshingTree *surface_spheres,
 
             std::array<size_t, 3> key{ attrib[2], attrib[3], attrib[4] };
             std::sort(key.begin(), key.end());
-            if (face_set.find(key) == face_set.end())
+            if(key[0]==723 && key[1]==778 && key[2]==1989){
+                std::cout<<"Found sliver!"<<std::endl;
+            }
+            if(face_set.find(key) == face_set.end())
             {
                 seeds->lazy_delete_tree_point(iseed);
                 seeds->lazy_delete_tree_point(jseed);
@@ -817,23 +876,56 @@ void Generator::color_surface_seeds(int num_faces, MeshingTree *surface_spheres,
     std::cout << "  * Number of subregions detected: " << num_subregions << std::endl;
 
     // 6. Export Data
-    num_seeds = seeds->get_num_tree_points();
-    seedes = new double[num_seeds * 3];
-    seeds_region_id = new size_t[num_seeds];
-    seeds_sizing = new double[num_seeds];
-
+    size_t num_active_seeds = 0;
     for (size_t iseed = 0; iseed < num_seeds; iseed++)
     {
-        if (!seeds->tree_point_is_active(iseed)) continue;
-        double x[4];
-        seeds->get_tree_point(iseed, 4, x);
-        size_t* attrib = seeds->get_tree_point_attrib(iseed);
-		if(!attrib[5])std::cout<<attrib[5]<<std::endl;
-        for (size_t idim = 0; idim < 3; idim++) seedes[iseed * 3 + idim] = x[idim];
-        
-        // Output the calculated region ID
-        seeds_region_id[iseed] = attrib[5]; 
-        seeds_sizing[iseed] = x[3];
+        if (seeds->tree_point_is_active(iseed)) {
+            num_active_seeds++;
+        }
+    }
+
+    std::cout << "  * Compacting seeds: Total " << num_seeds << " -> Active " << num_active_seeds << std::endl;
+
+    // [2] 按照活跃数量分配内存
+    // 注意：如果 num_active_seeds 为 0，这里可能需要特殊处理，防止 new 0
+    if (num_active_seeds > 0) {
+        seedes = new double[num_active_seeds * 3];
+        seeds_region_id = new size_t[num_active_seeds];
+        seeds_sizing = new double[num_active_seeds];
+
+        // [3] 数据压实：只拷贝活跃点
+        size_t current_idx = 0;
+        for (size_t iseed = 0; iseed < num_seeds; iseed++)
+        {
+            if (!seeds->tree_point_is_active(iseed)) continue; // 跳过已删除的点
+
+            double x[4];
+            seeds->get_tree_point(iseed, 4, x);
+            size_t* attrib = seeds->get_tree_point_attrib(iseed);
+
+            // 调试输出（保留你原来的逻辑）
+            if(!attrib[5]) std::cout << "[Warning] Seed " << iseed << " has region ID 0!" << std::endl;
+
+            // 填充数据到紧凑的数组中
+            for (size_t idim = 0; idim < 3; idim++) {
+                seedes[current_idx * 3 + idim] = x[idim];
+            }
+            
+            seeds_region_id[current_idx] = attrib[5]; 
+            seeds_sizing[current_idx] = x[3];
+
+            current_idx++; // 只有写入了数据才移动指针
+        }
+
+        // [4] 生成 CSV，传入真实的活跃点数量
+        generate_seed_csv("seeds.csv", 3, num_active_seeds, seedes, seeds_sizing, seeds_region_id);
+    }
+    else {
+        // 防止空指针崩溃
+        seedes = nullptr;
+        seeds_region_id = nullptr;
+        seeds_sizing = nullptr;
+        std::cout << "[Warning] No active seeds to export." << std::endl;
     }
 
     generate_seed_csv("seeds.csv", 3, num_seeds, seedes, seeds_sizing, seeds_region_id);

@@ -30,6 +30,7 @@ public:
         MeshingTree *lower_seeds, 
         MeshingTree *seeds,
         std::vector<int> face, 
+        double** points,
         double* &seedes, 
         size_t* &seeds_region_id, 
         double* &seeds_sizing

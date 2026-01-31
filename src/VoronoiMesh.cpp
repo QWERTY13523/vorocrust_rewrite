@@ -3,7 +3,6 @@
 #include <fstream>
 #include <iomanip>
 
-#ifdef USE_CGAL
 #include <CGAL/Exact_predicates_exact_constructions_kernel.h>
 #include <CGAL/Delaunay_triangulation_3.h>
 #include <CGAL/Triangulation_vertex_base_with_info_3.h>
@@ -214,11 +213,3 @@ void Generator::generate_surface_mesh(MeshingTree* seeds, const char* output_fil
     std::cout << "  * Surface mesh saved to " << output_filename << std::endl;
     std::cout << "  * Total vertices: " << unique_vertices.size() << ", triangles: " << face_indices.size() << std::endl;
 }
-
-#else
-// Fallback when CGAL is not available
-void Generator::generate_surface_mesh(MeshingTree* seeds, const char* output_filename)
-{
-    std::cerr << "Error: generate_surface_mesh requires CGAL. Please rebuild with -DUSE_CGAL=ON" << std::endl;
-}
-#endif

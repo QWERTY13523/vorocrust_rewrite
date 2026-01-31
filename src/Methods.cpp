@@ -65,11 +65,11 @@ bool Methods::point_covered(double* point, MeshingTree* spheres, double alpha_co
 
 	double closest_sphere_radius = spheres->get_tree_point_attrib(closest_sphere, 0);
 
-	double estimated_face_center_radius = closest_sphere_radius + closest_dst;
+	double estimated_face_center_radius = closest_sphere_radius + 0.5 * closest_dst;
 
 	size_t num(0), cap(100);
 	size_t* neighbor_spheres = new size_t[cap];
-	double R = estimated_face_center_radius * 10;
+	double R = estimated_face_center_radius * 5;
 	spheres->get_tree_points_in_sphere(point, R, num, neighbor_spheres, cap);
 
 	bool covered(false);
@@ -84,6 +84,10 @@ bool Methods::point_covered(double* point, MeshingTree* spheres, double alpha_co
 		if (h < beta * sphere[3] + 1E-10)
 		{
 			covered = true;
+			 if (num_covering_spheres < cap_covering_spheres) {
+				covering_spheres[num_covering_spheres] = isphere;
+				num_covering_spheres++;
+    }
 		}
 	}
 
