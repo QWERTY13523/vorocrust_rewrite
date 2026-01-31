@@ -630,6 +630,7 @@ void Generator::color_surface_seeds(int num_faces, MeshingTree *surface_spheres,
             }
             if(face_set.find(key) == face_set.end())
             {
+                std::cout<<key[0]<<" "<<key[1]<<" "<<key[2]<<std::endl;
                 seeds->lazy_delete_tree_point(iseed);
                 seeds->lazy_delete_tree_point(jseed);
             }
@@ -928,7 +929,62 @@ void Generator::color_surface_seeds(int num_faces, MeshingTree *surface_spheres,
         std::cout << "[Warning] No active seeds to export." << std::endl;
     }
 
-    generate_seed_csv("seeds.csv", 3, num_seeds, seedes, seeds_sizing, seeds_region_id);
+    // Rebuild seeds tree with only active points so downstream (e.g. generate_surface_mesh)
+    // sees the filtered/deleted set and pairing indices remain consistent.
+    if (num_active_seeds > 0 && num_active_seeds < num_seeds)
+    {
+        std::vector<size_t> old_to_new(num_seeds, static_cast<size_t>(-1));
+        size_t new_idx = 0;
+        for (size_t iseed = 0; iseed < num_seeds; iseed++)
+        {
+            if (!seeds->tree_point_is_active(iseed)) continue;
+            old_to_new[iseed] = new_idx;
+            new_idx++;
+        }
+
+        struct SeedSnapshot
+        {
+            double x[4];
+            double normal[4];
+            std::vector<size_t> attrib;
+        };
+        std::vector<SeedSnapshot> snapshots;
+        snapshots.reserve(num_active_seeds);
+
+        for (size_t iseed = 0; iseed < num_seeds; iseed++)
+        {
+            if (!seeds->tree_point_is_active(iseed)) continue;
+
+            SeedSnapshot s;
+            seeds->get_tree_point(iseed, 4, s.x);
+            double* n = seeds->get_tree_point_normal(iseed);
+            for (size_t idim = 0; idim < 4; idim++) s.normal[idim] = n[idim];
+
+            size_t* attrib = seeds->get_tree_point_attrib(iseed);
+            const size_t num_attrib = attrib ? attrib[0] : 0;
+            if (num_attrib > 0)
+            {
+                s.attrib.assign(attrib, attrib + num_attrib);
+                const size_t old_pair = (s.attrib.size() > 1) ? s.attrib[1] : static_cast<size_t>(-1);
+                if (old_pair < num_seeds && old_to_new[old_pair] != static_cast<size_t>(-1))
+                {
+                    s.attrib[1] = old_to_new[old_pair];
+                }
+                else if (s.attrib.size() > 1)
+                {
+                    s.attrib[1] = old_to_new[iseed];
+                }
+            }
+            snapshots.push_back(std::move(s));
+        }
+
+        seeds->clear_memory();
+        for (size_t i = 0; i < snapshots.size(); i++)
+        {
+            size_t* attrib_ptr = snapshots[i].attrib.empty() ? nullptr : snapshots[i].attrib.data();
+            seeds->add_tree_point(4, snapshots[i].x, snapshots[i].normal, attrib_ptr);
+        }
+    }
 }
 	
 
