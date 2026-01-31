@@ -28,6 +28,43 @@ void Generator::generate_surface_mesh(MeshingTree* seeds, const char* output_fil
         return;
     }
 
+    // ==================================================================================
+    // [新增部分] 0. 导出未删除的种子点 (Export Undeleted Seeds for Debugging)
+    // ==================================================================================
+    {
+        const char* debug_seeds_filename = "debug_active_seeds_for_mesh.obj";
+        std::cout << "  * Exporting active seeds to " << debug_seeds_filename << " ..." << std::endl;
+        std::ofstream seeds_out(debug_seeds_filename);
+        if (seeds_out.is_open()) {
+            seeds_out << "# Active seeds used for meshing\n";
+            seeds_out << "# Format: v x y z r g b\n";
+            
+            size_t count = 0;
+            for (size_t i = 0; i < num_seeds; i++) {
+                if (!seeds->tree_point_is_active(i)) continue;
+                
+                double* pt = seeds->get_tree_point(i);
+                size_t* attrib = seeds->get_tree_point_attrib(i);
+                size_t region_id = attrib[5]; // 获取区域ID用于着色
+
+                // 简单着色：1=内(红), 2=外(蓝), 其他=绿/黄
+                double r = 0.0, g = 0.0, b = 0.0;
+                if (region_id == 1)      { r = 1.0; g = 0.0; b = 0.0; } // Inside: Red
+                else if (region_id == 2) { r = 0.0; g = 0.0; b = 1.0; } // Outside: Blue
+                else                     { r = 0.0; g = 1.0; b = 0.0; } // Others: Green
+
+                seeds_out << "v " << pt[0] << " " << pt[1] << " " << pt[2] 
+                          << " " << r << " " << g << " " << b << "\n";
+                count++;
+            }
+            seeds_out.close();
+            std::cout << "  * Exported " << count << " active seeds." << std::endl;
+        } else {
+            std::cerr << "[Warning] Could not write to " << debug_seeds_filename << std::endl;
+        }
+    }
+    // ==================================================================================
+
     // 1. Build Delaunay triangulation with seed index info
     Delaunay dt;
     std::vector<Vertex_handle> vertex_handles(num_seeds);
@@ -42,9 +79,7 @@ void Generator::generate_surface_mesh(MeshingTree* seeds, const char* output_fil
     
     std::cout << "  * Delaunay triangulation built with " << dt.number_of_vertices() << " vertices" << std::endl;
 
-    // ==================================================================================
-    // [新增部分] 输出全局维诺图 (Global Voronoi Diagram Wireframe)
-    // ==================================================================================
+    // [保留原有] 输出全局维诺图线框 (Global Voronoi Diagram Wireframe)
     {
         std::cout << "  * Exporting global Voronoi diagram to global_voronoi.obj ..." << std::endl;
         std::ofstream vor_out("global_voronoi.obj");
@@ -53,19 +88,10 @@ void Generator::generate_surface_mesh(MeshingTree* seeds, const char* output_fil
             vor_out << "# Global Voronoi Diagram (Finite Edges Only)\n";
             
             size_t edge_v_count = 1;
-            
-            // 遍历所有有限的 Delaunay 面 (Finite Facets)
-            // 在 3D 中，Delaunay 面 <---> Voronoi 边
             for (auto fit = dt.finite_facets_begin(); fit != dt.finite_facets_end(); ++fit) {
-                // 计算对偶对象
                 CGAL::Object o = dt.dual(*fit);
-                
-                // 我们只输出有限的线段 (Segment)，忽略射线 (Ray)
                 if (const K::Segment_3* s = CGAL::object_cast<K::Segment_3>(&o)) {
-                    
-                    // (可选) 过滤掉过长的线段，防止某些退化四面体导致的无穷远点干扰视图
                     if (s->squared_length() > 1e12) continue; 
-
                     vor_out << "v " << s->source().x() << " " << s->source().y() << " " << s->source().z() << "\n";
                     vor_out << "v " << s->target().x() << " " << s->target().y() << " " << s->target().z() << "\n";
                     vor_out << "l " << edge_v_count << " " << edge_v_count + 1 << "\n";
@@ -74,11 +100,8 @@ void Generator::generate_surface_mesh(MeshingTree* seeds, const char* output_fil
             }
             vor_out.close();
             std::cout << "  * Done." << std::endl;
-        } else {
-            std::cerr << "Error: Cannot write to global_voronoi.obj" << std::endl;
         }
     }
-    // ==================================================================================
 
     // 2. Collect Voronoi facets for inside/outside seed pairs
     std::vector<std::vector<Point_3>> voronoi_facets;
@@ -98,18 +121,11 @@ void Generator::generate_surface_mesh(MeshingTree* seeds, const char* output_fil
         size_t* attrib1 = seeds->get_tree_point_attrib(seed_idx1);
         size_t* attrib2 = seeds->get_tree_point_attrib(seed_idx2);
         
-        // attrib[1] is the pair seed index
-        // 这里使用之前生成的配对信息，或者可以改用区域 ID (attrib[5]) 判断: 
-        // bool is_interface = (attrib1[5] != attrib2[5]) && (attrib1[5] != 0) && (attrib2[5] != 0);
         bool is_pair = (attrib1[1] == seed_idx2) || (attrib2[1] == seed_idx1);
         
         if (!is_pair) continue;
         
-        // This edge connects a seed pair - extract the dual Voronoi facet
-        // The Voronoi facet is the convex polygon formed by circumcenters of 
-        // cells incident to this edge
         std::vector<Point_3> facet_vertices;
-        
         Delaunay::Cell_circulator cc = dt.incident_cells(*eit);
         Delaunay::Cell_circulator done = cc;
         
@@ -117,9 +133,6 @@ void Generator::generate_surface_mesh(MeshingTree* seeds, const char* output_fil
         
         do {
             if (!dt.is_infinite(cc)) {
-                // Compute circumcenter manually or use CGAL dual
-                // Using dual() is safer and usually cached/optimized in some kernels, 
-                // but manual construction as you did is also fine for Exact kernel.
                 Point_3 center = dt.dual(cc); 
                 facet_vertices.push_back(center);
             }
@@ -143,15 +156,11 @@ void Generator::generate_surface_mesh(MeshingTree* seeds, const char* output_fil
     obj_file << "# Voronoi surface mesh generated by VoroCrust" << std::endl;
     obj_file << "# Number of facets: " << voronoi_facets.size() << std::endl;
     
-    // Use a map to avoid duplicate vertices
-    // Note: Using Exact kernel points as map keys might be slow or tricky with rounding.
-    // Your rounding strategy is good for merging close points.
     std::map<std::tuple<double, double, double>, size_t> vertex_map;
     std::vector<Point_3> unique_vertices;
     std::vector<std::vector<size_t>> face_indices;
     
     auto get_vertex_index = [&](const Point_3& p) -> size_t {
-        // Round to avoid floating point precision issues
         double x = std::round(CGAL::to_double(p.x()) * 1e10) / 1e10;
         double y = std::round(CGAL::to_double(p.y()) * 1e10) / 1e10;
         double z = std::round(CGAL::to_double(p.z()) * 1e10) / 1e10;
@@ -167,7 +176,6 @@ void Generator::generate_surface_mesh(MeshingTree* seeds, const char* output_fil
         return idx;
     };
     
-    // Process facets and triangulate polygons
     for (const auto& facet : voronoi_facets) {
         if (facet.size() < 3) continue;
         
@@ -176,26 +184,20 @@ void Generator::generate_surface_mesh(MeshingTree* seeds, const char* output_fil
             indices.push_back(get_vertex_index(pt));
         }
         
-        // Fan triangulation for polygon with more than 3 vertices
-        // Improve triangulation: use centroid fan to create better triangles
         Point_3 centroid = CGAL::ORIGIN;
         for(const auto& pt : facet) centroid = centroid + (pt - CGAL::ORIGIN);
         double s = static_cast<double>(facet.size());
-		centroid = Point_3(centroid.x() / s, centroid.y() / s, centroid.z() / s);
+        centroid = Point_3(centroid.x() / s, centroid.y() / s, centroid.z() / s);
         size_t centroid_idx = get_vertex_index(centroid);
 
         for (size_t i = 0; i < indices.size(); i++) {
             size_t idx0 = indices[i];
             size_t idx1 = indices[(i + 1) % indices.size()];
-            
-            // 跳过退化三角形
             if (idx0 == idx1 || idx0 == centroid_idx || idx1 == centroid_idx) continue;
-
             face_indices.push_back({centroid_idx, idx0, idx1});
         }
     }
     
-    // Write vertices
     for (const auto& v : unique_vertices) {
         obj_file << "v " << std::setprecision(16) 
                  << CGAL::to_double(v.x()) << " " 
@@ -203,7 +205,6 @@ void Generator::generate_surface_mesh(MeshingTree* seeds, const char* output_fil
                  << CGAL::to_double(v.z()) << std::endl;
     }
     
-    // Write faces (OBJ uses 1-based indexing)
     for (const auto& face : face_indices) {
         obj_file << "f " << (face[0] + 1) << " " << (face[1] + 1) << " " << (face[2] + 1) << std::endl;
     }
