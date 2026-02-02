@@ -15,12 +15,12 @@ int main()
     MeshingTree *seeds = new MeshingTree();
     size_t num_points, num_faces, num_faces1;
     generator.read_input_obj_file("./data/obj/block.obj",num_points,points,num_faces,faces);
-    generator.generate_spheres("./data/spheres/Sphere_8000_55.csv", spheres);
-    generator.read_obj_faces("/home/yiming/research/vorocrust/data/obj/Ours_8000_block_Remesh.obj",face_flat, num_faces1);
+    generator.generate_spheres("./data/spheres/Sphere_6000_55.csv", spheres);
+    generator.read_obj_faces("/home/yiming/research/vorocrust/data/obj/Ours_6000_block_Remesh.obj",face_flat, num_faces1);
     generator.generate_surface_seeds(num_points, points, num_faces, faces,
          spheres, upper_seeds, lower_seeds);
     generator.color_surface_seeds(num_faces1, spheres,upper_seeds, lower_seeds, seeds,
         face_flat, points, seedes, seeds_region_id, seeds_sizing);
     //generator.generate_seed_csv("seeds.csv",3,seeds->get_num_tree_points(),seedes, seeds_sizing, seeds_region_id);
-    generator.generate_surface_mesh(seeds, "surface_mesh.obj");
+    generator.generate_surface_mesh(seeds, "surface_mesh1.obj");
 }

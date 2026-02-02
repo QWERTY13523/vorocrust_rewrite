@@ -152,10 +152,17 @@ void Generator::generate_spheres(const char* filename, MeshingTree *&spheres)
     int fid;
     if (!(ss >> x >> y >> z >> r >> fid))
       continue;
+    double nx = 0.0, ny = 0.0, nz = 0.0;
+    if (!(ss >> nx >> ny >> nz)) {
+      nx = 0.0;
+      ny = 0.0;
+      nz = 0.0;
+    }
     double s[4] = {x, y, z, r};
+    double n[4] = {nx, ny, nz, 0.0};
     size_t attrib[3] = {2, 0, count + 1}; // {长度, 来源面索引(占位或真实面号)}
     attrib[1] = fid;
-    spheres->add_tree_point(4, s, /*normal=*/0, attrib);
+    spheres->add_tree_point(4, s, n, attrib);
     ++count;
   }
 }
@@ -248,7 +255,6 @@ void Generator::read_obj_faces(const char* filename, std::vector<int>& faces_fla
 //         }
 //     }
 // }
-
 void Generator::generate_surface_seeds(size_t num_points, double **points, size_t num_faces, size_t **faces,
          MeshingTree *spheres,MeshingTree *upper_seeds, MeshingTree *lower_seeds)
 {
@@ -384,17 +390,17 @@ void Generator::generate_surface_seeds(size_t num_points, double **points, size_
                 if(upper_covered && lower_covered)continue;
                 if(upper_covered != lower_covered)
                 {
-                    std::cout << "Sliver! caused by spheres " << sphere_index_i << " " << sphere_index_j << " " << sphere_index_k << std::endl;
-                    for(int i=0;i<3;i++)
-                    {
-                        std::cout<<upper_seed[i]<<" ";
-                    }
-                    std::cout<<std::endl;
-                    for(int i=0;i<3;i++)
-                    {
-                        std::cout<<lower_seed[i]<<" ";
-                    }
-                    std::cout<<std::endl;
+                    // std::cout << "Sliver! caused by spheres " << sphere_index_i << " " << sphere_index_j << " " << sphere_index_k << std::endl;
+                    // for(int i=0;i<3;i++)
+                    // {
+                    //     std::cout<<upper_seed[i]<<" ";
+                    // }
+                    // std::cout<<std::endl;
+                    // for(int i=0;i<3;i++)
+                    // {
+                    //     std::cout<<lower_seed[i]<<" ";
+                    // }
+                    // std::cout<<std::endl;
                     
                     // Get sphere centers for the three spheres causing the sliver
                     double sphere_i_center[4], sphere_j_center[4], sphere_k_center[4];
@@ -557,12 +563,11 @@ void Generator::generate_surface_seeds(size_t num_points, double **points, size_
 		std::cout << "  * Min. relative distance between lower and upper seeds = " << min_dst_ul << std::endl;
 }
 
+
 void Generator::color_surface_seeds(int num_faces, MeshingTree *surface_spheres, MeshingTree *upper_seeds, MeshingTree *lower_seeds, MeshingTree *seeds,
     std::vector<int> face, double** points, double* &seedes, size_t* &seeds_region_id, double* &seeds_sizing)
 {
     std::cout << "[Info] Starting robust color_surface_seeds..." << std::endl;
-
-    // 1. Merge Upper and Lower seeds into 'seeds' tree
     size_t num_upper_seeds(upper_seeds->get_num_tree_points());
     size_t num_lower_seeds(lower_seeds->get_num_tree_points());
 
@@ -604,16 +609,6 @@ void Generator::color_surface_seeds(int num_faces, MeshingTree *surface_spheres,
 
         std::unordered_set<std::array<size_t, 3>, FaceKeyHash> face_set;
         face_set.reserve(static_cast<size_t>(num_faces) * 2);
-        for (int i = 0; i < num_faces; i++)
-        {
-            size_t a = static_cast<size_t>(face[3 * i + 0]);
-            size_t b = static_cast<size_t>(face[3 * i + 1]);
-            size_t c = static_cast<size_t>(face[3 * i + 2]);
-            std::array<size_t, 3> key{ a, b, c };
-            std::sort(key.begin(), key.end());
-            face_set.insert(key);
-        }
-
         for (size_t iseed = 0; iseed < num_seeds; iseed++)
         {
             if (!seeds->tree_point_is_active(iseed)) continue;
@@ -625,312 +620,441 @@ void Generator::color_surface_seeds(int num_faces, MeshingTree *surface_spheres,
 
             std::array<size_t, 3> key{ attrib[2], attrib[3], attrib[4] };
             std::sort(key.begin(), key.end());
-            if(key[0]==723 && key[1]==778 && key[2]==1989){
-                std::cout<<"Found sliver!"<<std::endl;
-            }
             if(face_set.find(key) == face_set.end())
             {
-                std::cout<<key[0]<<" "<<key[1]<<" "<<key[2]<<std::endl;
                 seeds->lazy_delete_tree_point(iseed);
                 seeds->lazy_delete_tree_point(jseed);
             }
         }
     }
 
-    // 3. Build connectivity graph
-    for (size_t iseed = 0; iseed < num_seeds; iseed++)
+    // 3. Color seeds using surface sphere normals (outside=0, inside=1)
+    size_t num_spheres = surface_spheres->get_num_tree_points();
+    auto compute_seed_dot = [&](size_t seed_index) -> double {
+        double seed[4];
+        seeds->get_tree_point(seed_index, 4, seed);
+        size_t* attrib = seeds->get_tree_point_attrib(seed_index);
+        size_t sphere_indices[3] = {attrib[2], attrib[3], attrib[4]};
+
+        double dot_sum = 0.0;
+        int count = 0;
+        for (size_t i = 0; i < 3; ++i) {
+            size_t si = sphere_indices[i];
+            if (si >= num_spheres) continue;
+            double center[4];
+            surface_spheres->get_tree_point(si, 4, center);
+            double* normal = surface_spheres->get_tree_point_normal(si);
+            double nx = normal[0];
+            double ny = normal[1];
+            double nz = normal[2];
+            double nlen_sq = nx * nx + ny * ny + nz * nz;
+            if (nlen_sq < 1e-20) continue;
+            double dx = seed[0] - center[0];
+            double dy = seed[1] - center[1];
+            double dz = seed[2] - center[2];
+            dot_sum += dx * nx + dy * ny + dz * nz;
+            count++;
+        }
+        if (count == 0) return 0.0;
+        return dot_sum / static_cast<double>(count);
+    };
+
+    for (size_t iseed = 0; iseed < num_seeds; ++iseed)
     {
         if (!seeds->tree_point_is_active(iseed)) continue;
         size_t* attrib = seeds->get_tree_point_attrib(iseed);
-        size_t si(attrib[2]), sj(attrib[3]), sk(attrib[4]);
-        surface_spheres->graph_connect(si, iseed);
-        surface_spheres->graph_connect(sj, iseed);
-        surface_spheres->graph_connect(sk, iseed);
+        size_t jseed = attrib[1];
+        if (jseed >= num_seeds || !seeds->tree_point_is_active(jseed))
+        {
+            double dot = compute_seed_dot(iseed);
+            attrib[5] = (dot < 0.0) ? 1 : 0;
+            continue;
+        }
+        if (iseed > jseed) continue;
+
+        double dot_i = compute_seed_dot(iseed);
+        double dot_j = compute_seed_dot(jseed);
+        size_t outside_seed = (dot_i >= dot_j) ? iseed : jseed;
+        size_t inside_seed = (outside_seed == iseed) ? jseed : iseed;
+        seeds->get_tree_point_attrib(outside_seed)[5] = 0;
+        seeds->get_tree_point_attrib(inside_seed)[5] = 1;
     }
-
-    double* face_normal = new double[3];
-    double** face_corners = new double*[3];
-    size_t num_spheres(surface_spheres->get_num_tree_points());
-
-    // 4. Propagate Orientation (The Vorocrust Method)
-    for (size_t isphere = 0; isphere < num_spheres; isphere++)
-    {
-        std::vector<size_t> sphere_seeds;
-        surface_spheres->graph_get_neighbors(isphere, sphere_seeds);
-        if (sphere_seeds.empty()) continue;
-
-        size_t num_sphere_seeds = sphere_seeds.size();
-
-        // [Step A] Reset markers for this sphere
-        for (size_t i = 0; i < num_sphere_seeds; i++)
-        {
-            size_t seed_i(sphere_seeds[i]);
-            size_t* attrib = seeds->get_tree_point_attrib(seed_i);
-            attrib[5] = 0; // 0 means unvisited/undefined for this local loop
-        }
-
-        size_t first_neighbor(isphere), jsphere(isphere);
-
-        // [Step B] Pick the first seed to dictate orientation
-        if (true)
-        {
-            size_t seed_1(sphere_seeds[0]); // Pick the first valid one
-            size_t* attrib = seeds->get_tree_point_attrib(seed_1);
-
-            size_t seed_2(attrib[1]);
-            size_t si(attrib[2]), sj(attrib[3]), sk(attrib[4]);
-
-            // [CRITICAL] Rotate indices so 'si' is the current sphere
-            while (si != isphere)
-            {
-                size_t tmp = si; si = sj; sj = sk; sk = tmp;
-            }
-
-            double* x_1 = seeds->get_tree_point(seed_1);
-            double* x_2 = seeds->get_tree_point(seed_2);
-
-            face_corners[0] = surface_spheres->get_tree_point(si);
-            face_corners[1] = surface_spheres->get_tree_point(sj);
-            face_corners[2] = surface_spheres->get_tree_point(sk);
-
-            _geom.get_3d_triangle_normal(face_corners, face_normal);
-
-            double dot(0.0);
-            for (size_t idim = 0; idim < 3; idim++) dot += (x_2[idim] - x_1[idim]) * face_normal[idim];
-
-            if (dot > 0.0)
-            {
-                attrib[5] = 1; // 1: Inside
-                attrib = seeds->get_tree_point_attrib(seed_2);
-                attrib[5] = 2; // 2: Outside
-            }
-            else
-            {
-                attrib[5] = 2; // Outside
-                attrib = seeds->get_tree_point_attrib(seed_2);
-                attrib[5] = 1; // Inside
-            }
-            first_neighbor = sj; // Record where we started
-            jsphere = sk;        // The vertex we are moving towards
-        }
-
-        // [Step C] Walk the loop (Topological Propagation)
-        while (true)
-        {
-            bool done(true);
-
-            // Look for the next neighbor in the chain
-            for (size_t i = 0; i < num_sphere_seeds; i++)
-            {
-                size_t seed_1(sphere_seeds[i]);
-                size_t* attrib = seeds->get_tree_point_attrib(seed_1);
-
-                if (attrib[5] != 0) continue; // Already processed
-
-                size_t seed_2(attrib[1]);
-                size_t si(attrib[2]), sj(attrib[3]), sk(attrib[4]);
-
-                // [CRITICAL] Rotate indices again
-                while (si != isphere)
-                {
-                    size_t tmp = si; si = sj; sj = sk; sk = tmp;
-                }
-
-                // We are looking for a triangle that shares the edge (si, jsphere)
-                // In a valid traversal, one of sj or sk MUST be jsphere.
-                if (sj != jsphere && sk != jsphere) continue; // Not the neighbor we want
-
-                // [CRITICAL FIX] Enforce winding order
-                // If sj is NOT the shared vertex, it means the triangle is flipped relative to our traversal.
-                // We MUST swap sj and sk to maintain consistent normal direction.
-                if (sj != jsphere)
-                {
-                    size_t tmp = sj; sj = sk; sk = tmp;
-                }
-
-                // Now calculate normal with the CONSISTENT vertex order (si, sj, sk)
-                double* x_1 = seeds->get_tree_point(seed_1);
-                double* x_2 = seeds->get_tree_point(seed_2);
-
-                face_corners[0] = surface_spheres->get_tree_point(si);
-                face_corners[1] = surface_spheres->get_tree_point(sj);
-                face_corners[2] = surface_spheres->get_tree_point(sk);
-
-                _geom.get_3d_triangle_normal(face_corners, face_normal);
-
-                double dot(0.0);
-                for (size_t idim = 0; idim < 3; idim++) dot += (x_2[idim] - x_1[idim]) * face_normal[idim];
-
-                if (dot > 0.0)
-                {
-                    attrib[5] = 1; // Inside
-                    attrib = seeds->get_tree_point_attrib(seed_2);
-                    attrib[5] = 2; // Outside
-                }
-                else
-                {
-                    attrib[5] = 2; // Outside
-                    attrib = seeds->get_tree_point_attrib(seed_2);
-                    attrib[5] = 1; // Inside
-                }
-
-                jsphere = sk; // Advance to the next vertex
-                if (jsphere == first_neighbor) done = true; // Loop closed
-                
-                done = false; // Found a valid step, continue the while loop
-                break; 
-            }
-            if (done) break; // No more neighbors found or loop closed
-        }
-
-        // [Step D] Connect compatible seeds
-        // Now that seeds on this sphere are locally consistent, connect them in the graph
-        for (size_t i = 0; i < num_sphere_seeds; i++)
-        {
-            size_t seed_i(sphere_seeds[i]);
-            size_t* attrib_i = seeds->get_tree_point_attrib(seed_i);
-            
-            // Only connect processed seeds
-            if(attrib_i[5] == 0) continue;
-
-            for (size_t j = i + 1; j < num_sphere_seeds; j++)
-            {
-                size_t seed_j(sphere_seeds[j]);
-                size_t* attrib_j = seeds->get_tree_point_attrib(seed_j);
-
-                if (attrib_i[5] == attrib_j[5])
-                {
-                    seeds->graph_connect_nodes(seed_i, seed_j);
-                }
-            }
-        }
-
-        // [Step E] Reset for global coloring
-        // We wipe the local 1/2 markers because we will re-flood globally
-        for (size_t i = 0; i < num_sphere_seeds; i++)
-        {
-            size_t seed_i(sphere_seeds[i]);
-            size_t* attrib = seeds->get_tree_point_attrib(seed_i);
-            attrib[5] = 0;
-        }
-    }
-
-    delete[] face_normal;
-    delete[] face_corners;
-
-    // 5. Global Coloring (Flooding Disjoint Subgraphs)
-    size_t region_id(0);
-    while (true)
-    {
-        bool done = true;
-        // Find a seed not yet colored
-        for (size_t iseed = 0; iseed < num_seeds; iseed++)
-        {
-            if (!seeds->tree_point_is_active(iseed)) continue;
-            size_t* attrib = seeds->get_tree_point_attrib(iseed);
-            if (attrib[5] != 0) continue;
-            region_id++; attrib[5] = region_id;
-            done = false;
-            break;
-        }
-        if (done) break;
-
-        // Flood fill from that seed
-        while (true)
-        {
-            bool subregion_done(true);
-            for (size_t iseed = 0; iseed < num_seeds; iseed++)
-            {
-                if (!seeds->tree_point_is_active(iseed)) continue;
-                size_t* attrib = seeds->get_tree_point_attrib(iseed);
-                if (attrib[5] != region_id) continue;
-
-                std::vector<size_t> neighbor_seeds;
-                seeds->graph_get_neighbors(iseed, neighbor_seeds);
-                if (neighbor_seeds.empty()) continue;
-
-                for (size_t i = 0; i < neighbor_seeds.size(); i++)
-                {
-                    size_t neighbor_seed = neighbor_seeds[i];
-                    if (!seeds->tree_point_is_active(neighbor_seed)) continue;
-
-                    size_t* neighbor_attrib = seeds->get_tree_point_attrib(neighbor_seed);
-
-                    if (neighbor_attrib[5] != 0)
-                    {
-                        if (neighbor_attrib[5] != region_id)
-                        {
-                            // This indicates a topology error or inconsistency in local orientation
-                            // But usually safe to ignore in simple reconstruction
-                        }
-                        continue;
-                    }
-                    neighbor_attrib[5] = region_id;
-                    subregion_done = false;
-                }
-            }
-            if (subregion_done) break;
-        }
-    }
-
-    size_t num_subregions = region_id;
-    std::cout << "  * Number of subregions detected: " << num_subregions << std::endl;
-
-    // 6. Export Data
-    size_t num_active_seeds = 0;
-    for (size_t iseed = 0; iseed < num_seeds; iseed++)
-    {
-        if (seeds->tree_point_is_active(iseed)) {
-            num_active_seeds++;
-        }
-    }
-
-    std::cout << "  * Compacting seeds: Total " << num_seeds << " -> Active " << num_active_seeds << std::endl;
-
-    // [2] 按照活跃数量分配内存
-    // 注意：如果 num_active_seeds 为 0，这里可能需要特殊处理，防止 new 0
-    if (num_active_seeds > 0) {
-        seedes = new double[num_active_seeds * 3];
-        seeds_region_id = new size_t[num_active_seeds];
-        seeds_sizing = new double[num_active_seeds];
-
-        // [3] 数据压实：只拷贝活跃点
-        size_t current_idx = 0;
-        for (size_t iseed = 0; iseed < num_seeds; iseed++)
-        {
-            if (!seeds->tree_point_is_active(iseed)) continue; // 跳过已删除的点
-
-            double x[4];
-            seeds->get_tree_point(iseed, 4, x);
-            size_t* attrib = seeds->get_tree_point_attrib(iseed);
-
-            // 调试输出（保留你原来的逻辑）
-            if(!attrib[5]) std::cout << "[Warning] Seed " << iseed << " has region ID 0!" << std::endl;
-
-            // 填充数据到紧凑的数组中
-            for (size_t idim = 0; idim < 3; idim++) {
-                seedes[current_idx * 3 + idim] = x[idim];
-            }
-            
-            seeds_region_id[current_idx] = attrib[5]; 
-            seeds_sizing[current_idx] = x[3];
-
-            current_idx++; // 只有写入了数据才移动指针
-        }
-
-        // [4] 生成 CSV，传入真实的活跃点数量
-        generate_seed_csv("seeds.csv", 3, num_active_seeds, seedes, seeds_sizing, seeds_region_id);
-    }
-    else {
-        // 防止空指针崩溃
-        seedes = nullptr;
-        seeds_region_id = nullptr;
-        seeds_sizing = nullptr;
-        std::cout << "[Warning] No active seeds to export." << std::endl;
-    }
-
-    generate_seed_csv("seeds.csv", 3, num_seeds, seedes, seeds_sizing, seeds_region_id);
+    
 }
+// void Generator::color_surface_seeds(int num_faces, MeshingTree *surface_spheres, MeshingTree *upper_seeds, MeshingTree *lower_seeds, MeshingTree *seeds,
+//     std::vector<int> face, double** points, double* &seedes, size_t* &seeds_region_id, double* &seeds_sizing)
+// {
+//     std::cout << "[Info] Starting robust color_surface_seeds..." << std::endl;
+
+//     // 1. Merge Upper and Lower seeds into 'seeds' tree
+//     size_t num_upper_seeds(upper_seeds->get_num_tree_points());
+//     size_t num_lower_seeds(lower_seeds->get_num_tree_points());
+
+//     // Adjust id of seed pair for upper seeds
+//     for (size_t iseed = 0; iseed < num_upper_seeds; iseed++)
+//     {
+//         double x[4];
+//         upper_seeds->get_tree_point(iseed, 4, x);
+//         double* normal = upper_seeds->get_tree_point_normal(iseed);
+//         size_t* attrib = upper_seeds->get_tree_point_attrib(iseed);
+//         attrib[1] += num_upper_seeds; // Update pair index
+//         seeds->add_tree_point(4, x, normal, attrib);
+//     }
+//     upper_seeds->clear_memory();
+
+//     for (size_t iseed = 0; iseed < num_lower_seeds; iseed++)
+//     {
+//         double x[4];
+//         lower_seeds->get_tree_point(iseed, 4, x);
+//         double* normal = lower_seeds->get_tree_point_normal(iseed);
+//         size_t* attrib = lower_seeds->get_tree_point_attrib(iseed);
+//         seeds->add_tree_point(4, x, normal, attrib);
+//     }
+//     lower_seeds->clear_memory();
+
+//     // 2. Filter seeds based on OBJ faces (if provided)
+//     size_t num_seeds(seeds->get_num_tree_points());
+//     if (num_faces > 0 && !face.empty())
+//     {
+//         struct FaceKeyHash {
+//             size_t operator()(const std::array<size_t, 3>& a) const noexcept {
+//                 size_t h = 0;
+//                 h ^= std::hash<size_t>{}(a[0]) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+//                 h ^= std::hash<size_t>{}(a[1]) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+//                 h ^= std::hash<size_t>{}(a[2]) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+//                 return h;
+//             }
+//         };
+
+//         std::unordered_set<std::array<size_t, 3>, FaceKeyHash> face_set;
+//         face_set.reserve(static_cast<size_t>(num_faces) * 2);
+//         for (int i = 0; i < num_faces; i++)
+//         {
+//             size_t a = static_cast<size_t>(face[3 * i + 0]);
+//             size_t b = static_cast<size_t>(face[3 * i + 1]);
+//             size_t c = static_cast<size_t>(face[3 * i + 2]);
+//             std::array<size_t, 3> key{ a, b, c };
+//             std::sort(key.begin(), key.end());
+//             face_set.insert(key);
+//         }
+
+//         for (size_t iseed = 0; iseed < num_seeds; iseed++)
+//         {
+//             if (!seeds->tree_point_is_active(iseed)) continue;
+//             size_t* attrib = seeds->get_tree_point_attrib(iseed);
+//             const size_t jseed = attrib[1];
+//             if (jseed >= num_seeds) continue;
+//             if (iseed > jseed) continue; // Only process one of the pair
+//             if (!seeds->tree_point_is_active(jseed)) continue;
+
+//             std::array<size_t, 3> key{ attrib[2], attrib[3], attrib[4] };
+//             std::sort(key.begin(), key.end());
+//             // if(key[0]==723 && key[1]==778 && key[2]==1989){
+//             //     std::cout<<"Found sliver!"<<std::endl;
+//             // }    
+//             if(face_set.find(key) == face_set.end())
+//             {
+//                 // std::cout<<key[0]<<" "<<key[1]<<" "<<key[2]<<std::endl;
+//                 seeds->lazy_delete_tree_point(iseed);
+//                 seeds->lazy_delete_tree_point(jseed);
+//             }
+//         }
+//     }
+
+//     // 3. Build connectivity graph
+//     for (size_t iseed = 0; iseed < num_seeds; iseed++)
+//     {
+//         if (!seeds->tree_point_is_active(iseed)) continue;
+//         size_t* attrib = seeds->get_tree_point_attrib(iseed);
+//         size_t si(attrib[2]), sj(attrib[3]), sk(attrib[4]);
+//         surface_spheres->graph_connect(si, iseed);
+//         surface_spheres->graph_connect(sj, iseed);
+//         surface_spheres->graph_connect(sk, iseed);
+//     }
+
+//     double* face_normal = new double[3];
+//     double** face_corners = new double*[3];
+//     size_t num_spheres(surface_spheres->get_num_tree_points());
+
+//     // 4. Propagate Orientation (The Vorocrust Method)
+//     for (size_t isphere = 0; isphere < num_spheres; isphere++)
+//     {
+//         std::vector<size_t> sphere_seeds;
+//         surface_spheres->graph_get_neighbors(isphere, sphere_seeds);
+//         if (sphere_seeds.empty()) continue;
+
+//         size_t num_sphere_seeds = sphere_seeds.size();
+
+//         // [Step A] Reset markers for this sphere
+//         for (size_t i = 0; i < num_sphere_seeds; i++)
+//         {
+//             size_t seed_i(sphere_seeds[i]);
+//             size_t* attrib = seeds->get_tree_point_attrib(seed_i);
+//             attrib[5] = 0; // 0 means unvisited/undefined for this local loop
+//         }
+
+//         size_t first_neighbor(isphere), jsphere(isphere);
+
+//         // [Step B] Pick the first seed to dictate orientation
+//         if (true)
+//         {
+//             size_t seed_1(sphere_seeds[0]); // Pick the first valid one
+//             size_t* attrib = seeds->get_tree_point_attrib(seed_1);
+
+//             size_t seed_2(attrib[1]);
+//             size_t si(attrib[2]), sj(attrib[3]), sk(attrib[4]);
+
+//             // [CRITICAL] Rotate indices so 'si' is the current sphere
+//             while (si != isphere)
+//             {
+//                 size_t tmp = si; si = sj; sj = sk; sk = tmp;
+//             }
+
+//             double* x_1 = seeds->get_tree_point(seed_1);
+//             double* x_2 = seeds->get_tree_point(seed_2);
+
+//             face_corners[0] = surface_spheres->get_tree_point(si);
+//             face_corners[1] = surface_spheres->get_tree_point(sj);
+//             face_corners[2] = surface_spheres->get_tree_point(sk);
+
+//             _geom.get_3d_triangle_normal(face_corners, face_normal);
+
+//             double dot(0.0);
+//             for (size_t idim = 0; idim < 3; idim++) dot += (x_2[idim] - x_1[idim]) * face_normal[idim];
+
+//             if (dot > 0.0)
+//             {
+//                 attrib[5] = 1; // 1: Inside
+//                 attrib = seeds->get_tree_point_attrib(seed_2);
+//                 attrib[5] = 2; // 2: Outside
+//             }
+//             else
+//             {
+//                 attrib[5] = 2; // Outside
+//                 attrib = seeds->get_tree_point_attrib(seed_2);
+//                 attrib[5] = 1; // Inside
+//             }
+//             first_neighbor = sj; // Record where we started
+//             jsphere = sk;        // The vertex we are moving towards
+//         }
+
+//         // [Step C] Walk the loop (Topological Propagation)
+//         while (true)
+//         {
+//             bool done(true);
+
+//             // Look for the next neighbor in the chain
+//             for (size_t i = 0; i < num_sphere_seeds; i++)
+//             {
+//                 size_t seed_1(sphere_seeds[i]);
+//                 size_t* attrib = seeds->get_tree_point_attrib(seed_1);
+
+//                 if (attrib[5] != 0) continue; // Already processed
+
+//                 size_t seed_2(attrib[1]);
+//                 size_t si(attrib[2]), sj(attrib[3]), sk(attrib[4]);
+
+//                 // [CRITICAL] Rotate indices again
+//                 while (si != isphere)
+//                 {
+//                     size_t tmp = si; si = sj; sj = sk; sk = tmp;
+//                 }
+
+//                 // We are looking for a triangle that shares the edge (si, jsphere)
+//                 // In a valid traversal, one of sj or sk MUST be jsphere.
+//                 if (sj != jsphere && sk != jsphere) continue; // Not the neighbor we want
+
+//                 // [CRITICAL FIX] Enforce winding order
+//                 // If sj is NOT the shared vertex, it means the triangle is flipped relative to our traversal.
+//                 // We MUST swap sj and sk to maintain consistent normal direction.
+//                 if (sj != jsphere)
+//                 {
+//                     size_t tmp = sj; sj = sk; sk = tmp;
+//                 }
+
+//                 // Now calculate normal with the CONSISTENT vertex order (si, sj, sk)
+//                 double* x_1 = seeds->get_tree_point(seed_1);
+//                 double* x_2 = seeds->get_tree_point(seed_2);
+
+//                 face_corners[0] = surface_spheres->get_tree_point(si);
+//                 face_corners[1] = surface_spheres->get_tree_point(sj);
+//                 face_corners[2] = surface_spheres->get_tree_point(sk);
+
+//                 _geom.get_3d_triangle_normal(face_corners, face_normal);
+
+//                 double dot(0.0);
+//                 for (size_t idim = 0; idim < 3; idim++) dot += (x_2[idim] - x_1[idim]) * face_normal[idim];
+
+//                 if (dot > 0.0)
+//                 {
+//                     attrib[5] = 1; // Inside
+//                     attrib = seeds->get_tree_point_attrib(seed_2);
+//                     attrib[5] = 2; // Outside
+//                 }
+//                 else
+//                 {
+//                     attrib[5] = 2; // Outside
+//                     attrib = seeds->get_tree_point_attrib(seed_2);
+//                     attrib[5] = 1; // Inside
+//                 }
+
+//                 jsphere = sk; // Advance to the next vertex
+//                 if (jsphere == first_neighbor) done = true; // Loop closed
+                
+//                 done = false; // Found a valid step, continue the while loop
+//                 break; 
+//             }
+//             if (done) break; // No more neighbors found or loop closed
+//         }
+
+//         // [Step D] Connect compatible seeds
+//         // Now that seeds on this sphere are locally consistent, connect them in the graph
+//         for (size_t i = 0; i < num_sphere_seeds; i++)
+//         {
+//             size_t seed_i(sphere_seeds[i]);
+//             size_t* attrib_i = seeds->get_tree_point_attrib(seed_i);
+            
+//             // Only connect processed seeds
+//             if(attrib_i[5] == 0) continue;
+
+//             for (size_t j = i + 1; j < num_sphere_seeds; j++)
+//             {
+//                 size_t seed_j(sphere_seeds[j]);
+//                 size_t* attrib_j = seeds->get_tree_point_attrib(seed_j);
+
+//                 if (attrib_i[5] == attrib_j[5])
+//                 {
+//                     seeds->graph_connect_nodes(seed_i, seed_j);
+//                 }
+//             }
+//         }
+
+//         // [Step E] Reset for global coloring
+//         // We wipe the local 1/2 markers because we will re-flood globally
+//         for (size_t i = 0; i < num_sphere_seeds; i++)
+//         {
+//             size_t seed_i(sphere_seeds[i]);
+//             size_t* attrib = seeds->get_tree_point_attrib(seed_i);
+//             attrib[5] = 0;
+//         }
+//     }
+
+//     delete[] face_normal;
+//     delete[] face_corners;
+
+//     // 5. Global Coloring (Flooding Disjoint Subgraphs)
+//     size_t region_id(0);
+//     while (true)
+//     {
+//         bool done = true;
+//         // Find a seed not yet colored
+//         for (size_t iseed = 0; iseed < num_seeds; iseed++)
+//         {
+//             if (!seeds->tree_point_is_active(iseed)) continue;
+//             size_t* attrib = seeds->get_tree_point_attrib(iseed);
+//             if (attrib[5] != 0) continue;
+//             region_id++; attrib[5] = region_id;
+//             done = false;
+//             break;
+//         }
+//         if (done) break;
+
+//         // Flood fill from that seed
+//         while (true)
+//         {
+//             bool subregion_done(true);
+//             for (size_t iseed = 0; iseed < num_seeds; iseed++)
+//             {
+//                 if (!seeds->tree_point_is_active(iseed)) continue;
+//                 size_t* attrib = seeds->get_tree_point_attrib(iseed);
+//                 if (attrib[5] != region_id) continue;
+
+//                 std::vector<size_t> neighbor_seeds;
+//                 seeds->graph_get_neighbors(iseed, neighbor_seeds);
+//                 if (neighbor_seeds.empty()) continue;
+
+//                 for (size_t i = 0; i < neighbor_seeds.size(); i++)
+//                 {
+//                     size_t neighbor_seed = neighbor_seeds[i];
+//                     if (!seeds->tree_point_is_active(neighbor_seed)) continue;
+
+//                     size_t* neighbor_attrib = seeds->get_tree_point_attrib(neighbor_seed);
+
+//                     if (neighbor_attrib[5] != 0)
+//                     {
+//                         if (neighbor_attrib[5] != region_id)
+//                         {
+//                             // This indicates a topology error or inconsistency in local orientation
+//                             // But usually safe to ignore in simple reconstruction
+//                         }
+//                         continue;
+//                     }
+//                     neighbor_attrib[5] = region_id;
+//                     subregion_done = false;
+//                 }
+//             }
+//             if (subregion_done) break;
+//         }
+//     }
+
+//     size_t num_subregions = region_id;
+//     std::cout << "  * Number of subregions detected: " << num_subregions << std::endl;
+
+//     // 6. Export Data
+//     size_t num_active_seeds = 0;
+//     for (size_t iseed = 0; iseed < num_seeds; iseed++)
+//     {
+//         if (seeds->tree_point_is_active(iseed)) {
+//             num_active_seeds++;
+//         }
+//     }
+
+//     std::cout << "  * Compacting seeds: Total " << num_seeds << " -> Active " << num_active_seeds << std::endl;
+
+//     // [2] 按照活跃数量分配内存
+//     // 注意：如果 num_active_seeds 为 0，这里可能需要特殊处理，防止 new 0
+//     if (num_active_seeds > 0) {
+//         seedes = new double[num_active_seeds * 3];
+//         seeds_region_id = new size_t[num_active_seeds];
+//         seeds_sizing = new double[num_active_seeds];
+
+//         // [3] 数据压实：只拷贝活跃点
+//         size_t current_idx = 0;
+//         for (size_t iseed = 0; iseed < num_seeds; iseed++)
+//         {
+//             if (!seeds->tree_point_is_active(iseed)) continue; // 跳过已删除的点
+
+//             double x[4];
+//             seeds->get_tree_point(iseed, 4, x);
+//             size_t* attrib = seeds->get_tree_point_attrib(iseed);
+
+//             // 调试输出（保留你原来的逻辑）
+//            // if(!attrib[5]) std::cout << "[Warning] Seed " << iseed << " has region ID 0!" << std::endl;
+
+//             // 填充数据到紧凑的数组中
+//             for (size_t idim = 0; idim < 3; idim++) {
+//                 seedes[current_idx * 3 + idim] = x[idim];
+//             }
+            
+//             seeds_region_id[current_idx] = attrib[5]; 
+//             seeds_sizing[current_idx] = x[3];
+
+//             current_idx++; // 只有写入了数据才移动指针
+//         }
+
+//         // [4] 生成 CSV，传入真实的活跃点数量
+//         generate_seed_csv("seeds.csv", 3, num_active_seeds, seedes, seeds_sizing, seeds_region_id);
+//     }
+//     else {
+//         // 防止空指针崩溃
+//         seedes = nullptr;
+//         seeds_region_id = nullptr;
+//         seeds_sizing = nullptr;
+//         std::cout << "[Warning] No active seeds to export." << std::endl;
+//     }
+
+//     generate_seed_csv("seeds.csv", 3, num_seeds, seedes, seeds_sizing, seeds_region_id);
+// }
 	
 
 void Generator::generate_seed_csv(const char* filename, int num_dim, size_t num_seeds, double* spheres, double* spheres_sizing, size_t* spheres_region_id)
@@ -951,13 +1075,13 @@ void Generator::generate_seed_csv(const char* filename, int num_dim, size_t num_
 			file << std::setprecision(16) << spheres[i * num_dim];
 			for (size_t idim = 1; idim < num_dim; idim++) file << ", " << spheres[i * num_dim + idim];
 			file << ", " << spheres_sizing[i];
-			if (spheres_region_id != 0) file << ", " << spheres_region_id[i];
+			if (spheres_region_id != 0) file << ", " << spheres_region_id[i] - 1;
 		}
 		else
 		{
 			file << std::setprecision(16) << spheres[i * (num_dim + 1)];
 			for (size_t idim = 1; idim <= num_dim; idim++) file << ", " << spheres[i * (num_dim + 1) + idim];
-			if (spheres_region_id != 0) file << ", " << spheres_region_id[i];
+			if (spheres_region_id != 0) file << ", " << spheres_region_id[i] - 1;
 		}
 		file << std::endl;
 	}
