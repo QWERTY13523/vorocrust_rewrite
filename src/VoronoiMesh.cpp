@@ -1,624 +1,12 @@
-#include "Generator.h"
-#include <map>
-#include <unordered_map>
-#include <unordered_set>
-#include <fstream>
-#include <iomanip>
-#include <array>
-#include <queue>
-#include <string>
-#include<vector>
-#include <algorithm>
-#include <random>
-
-#include <CGAL/Exact_predicates_exact_constructions_kernel.h>
-#include <CGAL/Delaunay_triangulation_3.h>
-#include <CGAL/Triangulation_vertex_base_with_info_3.h>
-#include <CGAL/Delaunay_triangulation_cell_base_3.h> // 必须包含
-#include <CGAL/intersections.h>
-#include <CGAL/Timer.h>
-
-typedef CGAL::Exact_predicates_exact_constructions_kernel K;
-typedef CGAL::Triangulation_vertex_base_with_info_3<size_t, K> Vb;
-typedef CGAL::Delaunay_triangulation_cell_base_3<K> Cb; // 定义 Cell Base
-typedef CGAL::Triangulation_data_structure_3<Vb, Cb> Tds; // 传入 Vb 和 Cb
-typedef CGAL::Delaunay_triangulation_3<K, Tds> Delaunay;
-typedef Delaunay::Point Point_3;
-typedef Delaunay::Vertex_handle Vertex_handle;
-typedef Delaunay::Cell_handle Cell_handle;
-typedef Delaunay::Edge Edge;
-
-namespace {
-struct EdgeKey {
-    size_t a;
-    size_t b;
-    bool operator==(const EdgeKey& o) const noexcept { return a == o.a && b == o.b; }
-};
-
-struct EdgeKeyHash {
-    size_t operator()(const EdgeKey& k) const noexcept {
-        size_t h = 0;
-        h ^= std::hash<size_t>{}(k.a) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
-        h ^= std::hash<size_t>{}(k.b) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
-        return h;
-    }
-};
-
-struct SeedPairKey {
-    size_t a;
-    size_t b;
-    bool operator==(const SeedPairKey& o) const noexcept { return a == o.a && b == o.b; }
-};
-
-struct SeedPairKeyHash {
-    size_t operator()(const SeedPairKey& k) const noexcept {
-        size_t h = 0;
-        h ^= std::hash<size_t>{}(k.a) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
-        h ^= std::hash<size_t>{}(k.b) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
-        return h;
-    }
-};
-
-struct EdgeAdj {
-    int count = 0;
-    size_t tri0 = static_cast<size_t>(-1);
-    size_t tri1 = static_cast<size_t>(-1);
-};
-
-struct VoronoiFacet {
-    std::vector<Point_3> vertices;
-    size_t seed1;
-    size_t seed2;
-};
-
-bool is_dual_vertex_reliable(
-        const Point_3& dual_pt, 
-        const Point_3& seed_a, 
-        const Point_3& seed_b, 
-        double threshold_ratio = 50.0) 
-    {
-        // 计算种子对的间距平方
-        double d_seeds_sq = CGAL::to_double(CGAL::squared_distance(seed_a, seed_b));
-        if (d_seeds_sq < 1e-12) return false; // 种子重合，异常
-
-        // 计算外心到种子对中点的距离平方
-        Point_3 midpoint = CGAL::midpoint(seed_a, seed_b);
-        double d_dual_sq = CGAL::to_double(CGAL::squared_distance(dual_pt, midpoint));
-
-        // 如果外心距离 远大于 种子间距 (例如 50 倍)，则认为是 Sliver 造成的飞逸点
-        // 阈值 50.0 可以根据实际数据的密度调整，通常 10-100 都是合理的
-        return d_dual_sq <= (d_seeds_sq * threshold_ratio * threshold_ratio);
-    }
-
-}
-
-void Generator::generate_surface_mesh(MeshingTree* seeds, const char* output_filename)
-{
-    std::cout << "Generating surface mesh using CGAL Voronoi..." << std::endl;
-    
-    size_t num_seeds = seeds->get_num_tree_points();
-    if (num_seeds == 0) {
-        std::cerr << "Error: No seeds provided." << std::endl;
-        return;
-    }
-
-    // ==================================================================================
-    // [新增部分] 0. 导出未删除的种子点 (Export Undeleted Seeds for Debugging)
-    // ==================================================================================
-    {
-        const char* debug_seeds_filename = "debug_active_seeds_for_mesh.obj";
-        std::cout << "  * Exporting active seeds to " << debug_seeds_filename << " ..." << std::endl;
-        std::ofstream seeds_out(debug_seeds_filename);
-        if (seeds_out.is_open()) {
-            seeds_out << "# Active seeds used for meshing\n";
-            seeds_out << "# Format: v x y z r g b\n";
-            
-            size_t count = 0;
-            for (size_t i = 0; i < num_seeds; i++) {
-                if (!seeds->tree_point_is_active(i)) continue;
-                
-                double* pt = seeds->get_tree_point(i);
-                size_t* attrib = seeds->get_tree_point_attrib(i);
-                size_t region_id = attrib[5]; // 获取区域ID用于着色
-
-                // 简单着色：1=内(红), 2=外(蓝), 其他=绿/黄
-                double r = 0.0, g = 0.0, b = 0.0;
-                if (region_id == 1)      { r = 1.0; g = 0.0; b = 0.0; } // Inside: Red
-                else if (region_id == 2) { r = 0.0; g = 0.0; b = 1.0; } // Outside: Blue
-                else                     { r = 0.0; g = 1.0; b = 0.0; } // Others: Green
-
-                seeds_out << "v " << pt[0] << " " << pt[1] << " " << pt[2] 
-                          << " " << r << " " << g << " " << b << "\n";
-                count++;
-            }
-            seeds_out.close();
-            std::cout << "  * Exported " << count << " active seeds." << std::endl;
-        } else {
-            std::cerr << "[Warning] Could not write to " << debug_seeds_filename << std::endl;
-        }
-    }
-    // ==================================================================================
-
-    // 1. Build Delaunay triangulation with seed index info
-    Delaunay dt;
-    std::vector<Vertex_handle> vertex_handles(num_seeds);
-    
-    for (size_t i = 0; i < num_seeds; i++) {
-        if (!seeds->tree_point_is_active(i)) continue;
-        double* pt = seeds->get_tree_point(i);
-        Vertex_handle vh = dt.insert(Point_3(pt[0], pt[1], pt[2]));
-        vh->info() = i;
-        vertex_handles[i] = vh;
-    }
-    
-    std::cout << "  * Delaunay triangulation built with " << dt.number_of_vertices() << " vertices" << std::endl;
-
-    // [保留原有] 输出全局维诺图线框 (Global Voronoi Diagram Wireframe)
-    {
-        std::cout << "  * Exporting global Voronoi diagram to global_voronoi.obj ..." << std::endl;
-        std::ofstream vor_out("global_voronoi.obj");
-        if (vor_out.is_open()) {
-            vor_out << std::fixed << std::setprecision(16);
-            vor_out << "# Global Voronoi Diagram (Finite Edges Only)\n";
-            
-            size_t edge_v_count = 1;
-            for (auto fit = dt.finite_facets_begin(); fit != dt.finite_facets_end(); ++fit) {
-                CGAL::Object o = dt.dual(*fit);
-                if (const K::Segment_3* s = CGAL::object_cast<K::Segment_3>(&o)) {
-                    if (s->squared_length() > 1e12) continue; 
-                    vor_out << "v " << s->source().x() << " " << s->source().y() << " " << s->source().z() << "\n";
-                    vor_out << "v " << s->target().x() << " " << s->target().y() << " " << s->target().z() << "\n";
-                    vor_out << "l " << edge_v_count << " " << edge_v_count + 1 << "\n";
-                    edge_v_count += 2;
-                }
-            }
-            vor_out.close();
-            std::cout << "  * Done." << std::endl;
-        }
-    }
-
-    // 2. Collect Voronoi facets for inside/outside seed pairs
-    std::vector<VoronoiFacet> voronoi_facets;
-    
-    for (auto eit = dt.finite_edges_begin(); eit != dt.finite_edges_end(); ++eit) {
-        Cell_handle c = eit->first;
-        int i1 = eit->second;
-        int i2 = eit->third;
-        
-        Vertex_handle v1 = c->vertex(i1);
-        Vertex_handle v2 = c->vertex(i2);
-        
-        size_t seed_idx1 = v1->info();
-        size_t seed_idx2 = v2->info();
-        
-        // Check if this edge connects a seed pair (inside/outside)
-        size_t* attrib1 = seeds->get_tree_point_attrib(seed_idx1);
-        size_t* attrib2 = seeds->get_tree_point_attrib(seed_idx2);
-        
-        //bool is_pair = (attrib1[1] == seed_idx2) || (attrib2[1] == seed_idx1);
-        bool is_pair = attrib1[5] != attrib2[5];
-        
-        if (!is_pair) continue;
-        
-        std::vector<Point_3> facet_vertices;
-        Delaunay::Cell_circulator cc = dt.incident_cells(*eit);
-        Delaunay::Cell_circulator done = cc;
-        
-        if (cc == nullptr) continue;
-        
-        do {
-            if (!dt.is_infinite(cc)) {
-                Point_3 center = dt.dual(cc); 
-                facet_vertices.push_back(center);
-            }
-            ++cc;
-        } while (cc != done);
-        
-        if (facet_vertices.size() >= 3) {
-            voronoi_facets.push_back({facet_vertices, seed_idx1, seed_idx2});
-        }
-    }
-    
-    std::cout << "  * Found " << voronoi_facets.size() << " Voronoi facets for seed pairs" << std::endl;
-
-    std::cout << "  * Generated " << voronoi_facets.size() << " facets." << std::endl;
-
-    // 3. Write Surface Mesh OBJ file
-    std::ofstream obj_file(output_filename);
-    if (!obj_file.is_open()) {
-        std::cerr << "Error: Cannot open output file " << output_filename << std::endl;
-        return;
-    }
-    
-    obj_file << "# Voronoi surface mesh generated by VoroCrust" << std::endl;
-    obj_file << "# Number of facets: " << voronoi_facets.size() << std::endl;
-    
-    std::map<std::tuple<double, double, double>, size_t> vertex_map;
-    std::vector<Point_3> unique_vertices;
-    std::vector<std::vector<size_t>> face_indices;
-    std::vector<SeedPairKey> face_seed_pairs;
-    
-    auto get_vertex_index = [&](const Point_3& p) -> size_t {
-        double x = std::round(CGAL::to_double(p.x()) * 1e10) / 1e10;
-        double y = std::round(CGAL::to_double(p.y()) * 1e10) / 1e10;
-        double z = std::round(CGAL::to_double(p.z()) * 1e10) / 1e10;
-        auto key = std::make_tuple(x, y, z);
-        
-        auto it = vertex_map.find(key);
-        if (it != vertex_map.end()) {
-            return it->second;
-        }
-        size_t idx = unique_vertices.size();
-        vertex_map[key] = idx;
-        unique_vertices.push_back(p);
-        return idx;
-    };
-    
-    for (const auto& facet : voronoi_facets) {
-        if (facet.vertices.size() < 3) continue;
-        
-        std::vector<size_t> indices;
-        for (const auto& pt : facet.vertices) {
-            indices.push_back(get_vertex_index(pt));
-        }
-        
-        Point_3 centroid = CGAL::ORIGIN;
-        for(const auto& pt : facet.vertices) centroid = centroid + (pt - CGAL::ORIGIN);
-        double s = static_cast<double>(facet.vertices.size());
-        centroid = Point_3(centroid.x() / s, centroid.y() / s, centroid.z() / s);
-        size_t centroid_idx = get_vertex_index(centroid);
-
-        SeedPairKey sp{facet.seed1, facet.seed2};
-        if (sp.a > sp.b) std::swap(sp.a, sp.b);
-
-        for (size_t i = 0; i < indices.size(); i++) {
-            size_t idx0 = indices[i];
-            size_t idx1 = indices[(i + 1) % indices.size()];
-            if (idx0 == idx1 || idx0 == centroid_idx || idx1 == centroid_idx) continue;
-            face_indices.push_back({centroid_idx, idx0, idx1});
-            face_seed_pairs.push_back(sp);
-        }
-    }
-
-    if (face_indices.size() != face_seed_pairs.size()) {
-        std::cerr << "[Warning] face_indices and face_seed_pairs size mismatch." << std::endl;
-    }
-
-    // std::unordered_map<EdgeKey, EdgeAdj, EdgeKeyHash> edge_adjacency;
-    // edge_adjacency.reserve(face_indices.size() * 3);
-    // std::unordered_map<size_t, std::vector<size_t>> boundary_vertex_graph;
-
-    // auto add_edge = [&](size_t u, size_t v, size_t tri_id) {
-    //     if (u == v) return;
-    //     if (u > v) std::swap(u, v);
-    //     EdgeKey k{u, v};
-    //     auto& adj = edge_adjacency[k];
-    //     if (adj.count == 0) adj.tri0 = tri_id;
-    //     else if (adj.count == 1) adj.tri1 = tri_id;
-    //     adj.count++;
-    // };
-
-    // for (size_t ti = 0; ti < face_indices.size(); ti++) {
-    //     const auto& tri = face_indices[ti];
-    //     if (tri.size() != 3) continue;
-    //     add_edge(tri[0], tri[1], ti);
-    //     add_edge(tri[1], tri[2], ti);
-    //     add_edge(tri[2], tri[0], ti);
-    // }
-
-    // for (const auto& kv : edge_adjacency) {
-    //     if (kv.second.count == 1) {
-    //         const EdgeKey& e = kv.first;
-    //         boundary_vertex_graph[e.a].push_back(e.b);
-    //         boundary_vertex_graph[e.b].push_back(e.a);
-    //     }
-    // }
-
-    // std::unordered_set<size_t> boundary_vertices_visited;
-    // boundary_vertices_visited.reserve(boundary_vertex_graph.size() * 2);
-    // std::vector<std::vector<size_t>> hole_boundary_components;
-
-    // for (const auto& kv : boundary_vertex_graph) {
-    //     size_t start_v = kv.first;
-    //     if (boundary_vertices_visited.find(start_v) != boundary_vertices_visited.end()) continue;
-
-    //     std::vector<size_t> component_vertices;
-    //     std::queue<size_t> q;
-    //     q.push(start_v);
-    //     boundary_vertices_visited.insert(start_v);
-
-    //     while (!q.empty()) {
-    //         size_t v = q.front();
-    //         q.pop();
-    //         component_vertices.push_back(v);
-
-    //         auto it = boundary_vertex_graph.find(v);
-    //         if (it == boundary_vertex_graph.end()) continue;
-    //         for (size_t nb : it->second) {
-    //             if (boundary_vertices_visited.insert(nb).second) {
-    //                 q.push(nb);
-    //             }
-    //         }
-    //     }
-
-    //     if (!component_vertices.empty()) {
-    //         hole_boundary_components.push_back(std::move(component_vertices));
-    //     }
-    // }
-
-    // auto collect_voronoi_facets_for_seed = [&](size_t seed_idx) {
-    //     std::vector<std::vector<Point_3>> facets;
-    //     if (seed_idx >= num_seeds) return facets;
-    //     if (!seeds->tree_point_is_active(seed_idx)) return facets;
-
-    //     for (auto eit = dt.finite_edges_begin(); eit != dt.finite_edges_end(); ++eit) {
-    //         Cell_handle c = eit->first;
-    //         int i1 = eit->second;
-    //         int i2 = eit->third;
-
-    //         Vertex_handle v1 = c->vertex(i1);
-    //         Vertex_handle v2 = c->vertex(i2);
-
-    //         size_t s1 = v1->info();
-    //         size_t s2 = v2->info();
-
-    //         if (s1 != seed_idx && s2 != seed_idx) continue;
-
-    //         std::vector<Point_3> facet_vertices;
-    //         Delaunay::Cell_circulator cc = dt.incident_cells(*eit);
-    //         Delaunay::Cell_circulator done = cc;
-    //         if (cc == nullptr) continue;
-
-    //         do {
-    //             if (!dt.is_infinite(cc)) {
-    //                 facet_vertices.push_back(dt.dual(cc));
-    //             }
-    //             ++cc;
-    //         } while (cc != done);
-
-    //         if (facet_vertices.size() >= 3) {
-    //             facets.push_back(std::move(facet_vertices));
-    //         }
-    //     }
-    //     return facets;
-    // };
-
-    // auto export_voronoi_cells_obj = [&](
-    //     const std::string& filename,
-    //     const std::vector<size_t>& seeds_to_export
-    // ) {
-    //     std::ofstream out(filename);
-    //     if (!out.is_open()) {
-    //         std::cerr << "[Warning] Cannot open " << filename << " for writing." << std::endl;
-    //         return;
-    //     }
-
-    //     std::map<std::tuple<double, double, double>, size_t> vmap;
-    //     std::vector<Point_3> verts;
-    //     std::vector<std::array<size_t, 3>> tris;
-
-    //     auto get_vid = [&](const Point_3& p) -> size_t {
-    //         double x = std::round(CGAL::to_double(p.x()) * 1e10) / 1e10;
-    //         double y = std::round(CGAL::to_double(p.y()) * 1e10) / 1e10;
-    //         double z = std::round(CGAL::to_double(p.z()) * 1e10) / 1e10;
-    //         auto key = std::make_tuple(x, y, z);
-    //         auto it = vmap.find(key);
-    //         if (it != vmap.end()) return it->second;
-    //         size_t idx = verts.size();
-    //         vmap[key] = idx;
-    //         verts.push_back(p);
-    //         return idx;
-    //     };
-
-    //     for (size_t seed_idx : seeds_to_export) {
-    //         if (seed_idx >= num_seeds) continue;
-    //         if (!seeds->tree_point_is_active(seed_idx)) continue;
-
-    //         auto cell_facets = collect_voronoi_facets_for_seed(seed_idx);
-    //         for (const auto& facet : cell_facets) {
-    //             if (facet.size() < 3) continue;
-
-    //             std::vector<size_t> ids;
-    //             ids.reserve(facet.size());
-    //             for (const auto& p : facet) ids.push_back(get_vid(p));
-
-    //             Point_3 centroid = CGAL::ORIGIN;
-    //             for (const auto& p : facet) centroid = centroid + (p - CGAL::ORIGIN);
-    //             double s = static_cast<double>(facet.size());
-    //             centroid = Point_3(centroid.x() / s, centroid.y() / s, centroid.z() / s);
-    //             size_t cid = get_vid(centroid);
-
-    //             for (size_t i = 0; i < ids.size(); i++) {
-    //                 size_t a = ids[i];
-    //                 size_t b = ids[(i + 1) % ids.size()];
-    //                 if (a == b || a == cid || b == cid) continue;
-    //                 tris.push_back({cid, a, b});
-    //             }
-    //         }
-    //     }
-
-    //     out << "# Voronoi cells exported for hole-adjacent seed pairs\n";
-    //     for (const auto& v : verts) {
-    //         out << "v " << std::setprecision(16)
-    //             << CGAL::to_double(v.x()) << " "
-    //             << CGAL::to_double(v.y()) << " "
-    //             << CGAL::to_double(v.z()) << "\n";
-    //     }
-    //     for (const auto& t : tris) {
-    //         out << "f " << (t[0] + 1) << " " << (t[1] + 1) << " " << (t[2] + 1) << "\n";
-    //     }
-    //     out.close();
-    // };
-
-    // auto bbox_overlaps = [&](const CGAL::Bbox_3& a, const CGAL::Bbox_3& b) -> bool {
-    //     if (a.xmax() < b.xmin() || b.xmax() < a.xmin()) return false;
-    //     if (a.ymax() < b.ymin() || b.ymax() < a.ymin()) return false;
-    //     if (a.zmax() < b.zmin() || b.zmax() < a.zmin()) return false;
-    //     return true;
-    // };
-
-    // auto build_cell_tris_and_bbox = [&](
-    //     size_t seed_idx,
-    //     std::vector<K::Triangle_3>& tris,
-    //     CGAL::Bbox_3& bbox
-    // ) -> bool {
-    //     tris.clear();
-    //     bool have_bbox = false;
-    //     CGAL::Bbox_3 local_bbox;
-
-    //     if (seed_idx >= num_seeds) return false;
-    //     if (!seeds->tree_point_is_active(seed_idx)) return false;
-
-    //     auto cell_facets = collect_voronoi_facets_for_seed(seed_idx);
-    //     for (const auto& facet : cell_facets) {
-    //         if (facet.size() < 3) continue;
-
-    //         std::vector<size_t> ids;
-    //         ids.reserve(facet.size());
-    //         for (const auto& p : facet) {
-    //             if (!have_bbox) {
-    //                 local_bbox = p.bbox();
-    //                 have_bbox = true;
-    //             } else {
-    //                 local_bbox = local_bbox + p.bbox();
-    //             }
-    //         }
-
-    //         Point_3 centroid = CGAL::ORIGIN;
-    //         for (const auto& p : facet) centroid = centroid + (p - CGAL::ORIGIN);
-    //         double s = static_cast<double>(facet.size());
-    //         centroid = Point_3(centroid.x() / s, centroid.y() / s, centroid.z() / s);
-
-    //         if (!have_bbox) {
-    //             local_bbox = centroid.bbox();
-    //             have_bbox = true;
-    //         } else {
-    //             local_bbox = local_bbox + centroid.bbox();
-    //         }
-
-    //         for (size_t i = 0; i < facet.size(); i++) {
-    //             const Point_3& a = facet[i];
-    //             const Point_3& b = facet[(i + 1) % facet.size()];
-    //             if (a == b || a == centroid || b == centroid) continue;
-    //             tris.push_back(K::Triangle_3(centroid, a, b));
-    //         }
-    //     }
-
-    //     if (!have_bbox) return false;
-    //     bbox = local_bbox;
-    //     return true;
-    // };
-
-    // auto voronoi_cells_intersect = [&](size_t seed_a, size_t seed_b) -> bool {
-    //     std::vector<K::Triangle_3> tris_a;
-    //     std::vector<K::Triangle_3> tris_b;
-    //     CGAL::Bbox_3 bbox_a;
-    //     CGAL::Bbox_3 bbox_b;
-
-    //     if (!build_cell_tris_and_bbox(seed_a, tris_a, bbox_a)) return false;
-    //     if (!build_cell_tris_and_bbox(seed_b, tris_b, bbox_b)) return false;
-    //     if (!bbox_overlaps(bbox_a, bbox_b)) return false;
-
-    //     for (const auto& ta : tris_a) {
-    //         if (!bbox_overlaps(ta.bbox(), bbox_b)) continue;
-    //         for (const auto& tb : tris_b) {
-    //             if (!bbox_overlaps(ta.bbox(), tb.bbox())) continue;
-    //             if (CGAL::do_intersect(ta, tb)) return true;
-    //         }
-    //     }
-    //     return false;
-    // };
-
-    // if (!hole_boundary_components.empty()) {
-    //     std::string base(output_filename);
-    //     size_t dot = base.find_last_of('.');
-    //     if (dot != std::string::npos) base = base.substr(0, dot);
-
-    //     for (size_t hi = 0; hi < hole_boundary_components.size(); hi++) {
-    //         const auto& comp_vertices = hole_boundary_components[hi];
-    //         std::unordered_set<EdgeKey, EdgeKeyHash> comp_edges;
-    //         comp_edges.reserve(comp_vertices.size() * 4);
-    //         std::unordered_set<size_t> boundary_tris;
-    //         boundary_tris.reserve(comp_vertices.size() * 4);
-
-    //         for (size_t v : comp_vertices) {
-    //             auto it = boundary_vertex_graph.find(v);
-    //             if (it == boundary_vertex_graph.end()) continue;
-    //             for (size_t nb : it->second) {
-    //                 size_t a = v, b = nb;
-    //                 if (a > b) std::swap(a, b);
-    //                 EdgeKey ek{a, b};
-    //                 if (!comp_edges.insert(ek).second) continue;
-    //                 auto adj_it = edge_adjacency.find(ek);
-    //                 if (adj_it != edge_adjacency.end() && adj_it->second.count == 1 && adj_it->second.tri0 != static_cast<size_t>(-1)) {
-    //                     boundary_tris.insert(adj_it->second.tri0);
-    //                 }
-    //             }
-    //         }
-
-    //         std::unordered_set<SeedPairKey, SeedPairKeyHash> seed_pairs;
-    //         seed_pairs.reserve(boundary_tris.size() * 2);
-    //         std::unordered_set<size_t> seeds_to_export_set;
-    //         seeds_to_export_set.reserve(boundary_tris.size() * 4);
-
-    //         for (size_t ti : boundary_tris) {
-    //             if (ti >= face_seed_pairs.size()) continue;
-    //             SeedPairKey sp = face_seed_pairs[ti];
-    //             if (sp.a > sp.b) std::swap(sp.a, sp.b);
-    //             if (seed_pairs.insert(sp).second) {
-    //                 seeds_to_export_set.insert(sp.a);
-    //                 seeds_to_export_set.insert(sp.b);
-    //             }
-    //         }
-
-    //         std::vector<size_t> seeds_to_export;
-    //         seeds_to_export.reserve(seeds_to_export_set.size());
-    //         for (size_t s : seeds_to_export_set) seeds_to_export.push_back(s);
-    //         std::sort(seeds_to_export.begin(), seeds_to_export.end());
-
-    //         {
-    //             size_t num_intersect = 0;
-    //             size_t num_not_intersect = 0;
-    //             for (const auto& sp : seed_pairs) {
-    //                 bool is_intersect = voronoi_cells_intersect(sp.a, sp.b);
-    //                 std::cout << "  * Hole " << hi << " Voronoi cells intersect? seeds (" << sp.a << ", " << sp.b << ") -> "
-    //                           << (is_intersect ? "YES" : "NO") << std::endl;
-    //                 if (is_intersect) num_intersect++;
-    //                 else num_not_intersect++;
-    //             }
-    //             std::cout << "  * Hole " << hi << " intersection summary: YES=" << num_intersect
-    //                       << ", NO=" << num_not_intersect << std::endl;
-    //         }
-
-    //         if (!seeds_to_export.empty()) {
-    //             std::string hole_file = base + "_hole_" + std::to_string(hi) + "_cells.obj";
-    //             std::cout << "  * Exporting Voronoi cells for hole " << hi << " to " << hole_file << " ..." << std::endl;
-    //             export_voronoi_cells_obj(hole_file, seeds_to_export);
-    //         }
-    //     }
-    // }
-    
-    for (const auto& v : unique_vertices) {
-        obj_file << "v " << std::setprecision(16) 
-                 << CGAL::to_double(v.x()) << " " 
-                 << CGAL::to_double(v.y()) << " " 
-                 << CGAL::to_double(v.z()) << std::endl;
-    }
-    
-    for (const auto& face : face_indices) {
-        obj_file << "f " << (face[0] + 1) << " " << (face[1] + 1) << " " << (face[2] + 1) << std::endl;
-    }
-    
-    obj_file.close();
-    
-    std::cout << "  * Surface mesh saved to " << output_filename << std::endl;
-    std::cout << "  * Total vertices: " << unique_vertices.size() << ", triangles: " << face_indices.size() << std::endl;
-}
-
 // #include "Generator.h"
 // #include <map>
 // #include <fstream>
 // #include <iomanip>
+// #include <vector>
+// #include <set>
+// #include <array>
+// #include <tuple>
+// #include <algorithm>
 
 // #include <CGAL/Exact_predicates_exact_constructions_kernel.h>
 // #include <CGAL/Delaunay_triangulation_3.h>
@@ -635,6 +23,54 @@ void Generator::generate_surface_mesh(MeshingTree* seeds, const char* output_fil
 // typedef Delaunay::Cell_handle Cell_handle;
 // typedef Delaunay::Edge Edge;
 // typedef K::Point_3 Point;
+
+// struct LabeledPoint {
+//     Point point;
+//     int label;
+
+//     LabeledPoint(double x, double y, double z, int l)
+//         : point(x, y, z), label(l) {
+//     }
+// };
+
+// std::vector<Point> getVoronoiFace(const Delaunay& dt,
+//     Vertex_handle v1,
+//     Vertex_handle v2);
+
+// void exportBoundarySurface(const Delaunay& dt,
+//     const std::map<Vertex_handle, int>& vertex_labels,
+//     const std::string& filename);
+
+// void exportDelaunayBoundarySurface(const Delaunay& dt,
+//     const std::map<Vertex_handle, int>& vertex_labels,
+//     const std::string& filename);
+
+// void export_single_voronoi_polygon(
+//     const Delaunay& dt,
+//     Vertex_handle v1,
+//     Vertex_handle v2,
+//     const std::string& filename);
+
+// void write_voronoi_facets_to_obj_dedup(
+//     const std::string& filename,
+//     const std::vector<std::vector<Point_3>>& voronoi_facets
+// );
+
+// void write_voronoi_facets_triangulated_obj(
+//     const std::string& filename,
+//     const std::vector<std::vector<Point_3>>& voronoi_facets
+// );
+
+// void write_voronoi_facets_to_obj(
+//     const std::string& filename,
+//     const std::vector<std::vector<Point_3>>& voronoi_facets
+// );
+
+// void exportBoundarySurfaceImproved(const Delaunay& dt,
+//     const std::map<Vertex_handle, int>& vertex_labels,
+//     const std::string& filename);
+
+    
 // void Generator::generate_surface_mesh(MeshingTree* seeds, const char* output_filename)
 // {
 //     std::cout << "Generating surface mesh using CGAL Voronoi..." << std::endl;
@@ -923,14 +359,58 @@ void Generator::generate_surface_mesh(MeshingTree* seeds, const char* output_fil
     
 //     std::cout << "  * Surface mesh saved to " << output_filename << std::endl;
 //     std::cout << "  * Total vertices: " << unique_vertices.size() << ", triangles: " << face_indices.size() << std::endl;
-// }struct LabeledPoint {
-//     Point point;
-//     int label;
 
-//     LabeledPoint(double x, double y, double z, int l)
-//         : point(x, y, z), label(l) {
+//     // Integrate remaining workflows: label stats + boundary exports
+//     std::map<Vertex_handle, int> vertex_labels;
+//     std::map<int, int> label_counts;
+//     std::ofstream points_out("input_points.obj");
+//     std::ofstream points_out1("output_points.obj");
+//     if (points_out) {
+//         points_out << "# Input points\n";
 //     }
-// };
+//     if (points_out1) {
+//         points_out1 << "# Output points\n";
+//     }
+
+//     for (size_t i = 0; i < num_seeds; ++i) {
+//         if (!seeds->tree_point_is_active(i)) continue;
+//         size_t* attrib = seeds->get_tree_point_attrib(i);
+//         int label = static_cast<int>(attrib[5]);
+//         label_counts[label]++;
+
+//         Vertex_handle vh = vertex_handles[i];
+//         if (vh != Vertex_handle()) {
+//             vertex_labels[vh] = label;
+//         }
+
+//         double* pt = seeds->get_tree_point(i);
+//         if (points_out && label != 1) {
+//             points_out << "v " << pt[0] << " " << pt[1] << " " << pt[2] << "\n";
+//         } else if (points_out1 && label == 1) {
+//             points_out1 << "v " << pt[0] << " " << pt[1] << " " << pt[2] << "\n";
+//         }
+//     }
+
+//     if (points_out) {
+//         points_out.close();
+//     }
+//     if (points_out1) {
+//         points_out1.close();
+//     }
+
+//     std::cout << "\nLabel distribution:" << std::endl;
+//     for (const auto& pair : label_counts) {
+//         std::cout << "  Label " << pair.first << ": " << pair.second << " points" << std::endl;
+//     }
+
+//     if (!vertex_labels.empty()) {
+//         exportBoundarySurfaceImproved(dt, vertex_labels, "voronoi_surface.obj");
+//         exportDelaunayBoundarySurface(dt, vertex_labels, "delaunay_surface.obj");
+//         exportBoundarySurface(dt, vertex_labels, "voronoi_boundary.obj");
+//     }
+// }
+
+
 
 
 // // Get Voronoi face vertices for a Delaunay edge
@@ -1655,7 +1135,7 @@ void Generator::generate_surface_mesh(MeshingTree* seeds, const char* output_fil
 //     }
 
 //     for (const auto& p : ordered_points) {
-//         out << "v " << p.x() << " " << p.y() << " " << p.z() << std::endl;
+//         obj_file << "v " << p.x() << " " << p.y() << " " << p.z() << std::endl;
 //     }
 
 //     // 三角化并写入面
@@ -1832,3 +1312,395 @@ void Generator::generate_surface_mesh(MeshingTree* seeds, const char* output_fil
 //     std::cout << "  - Use delaunay_surface.obj for faster results" << std::endl;
 //     std::cout << "  - Use voronoi_surface.obj for true Voronoi surface" << std::endl;
 // }
+
+#include "Generator.h"
+
+// ==========================================
+// 1. 头文件与类型定义
+// ==========================================
+// 必须最先包含 Kernel
+#include <CGAL/Exact_predicates_exact_constructions_kernel.h>
+
+// 标准库
+#include <iostream>
+#include <fstream>
+#include <iomanip>
+#include <vector>
+#include <map>
+#include <set>
+#include <array>
+#include <tuple>
+#include <algorithm>
+#include <cmath>
+#include <string>
+
+// CGAL 其他头文件
+#include <CGAL/Delaunay_triangulation_3.h>
+#include <CGAL/Triangulation_vertex_base_with_info_3.h>
+#include <CGAL/Delaunay_triangulation_cell_base_3.h>
+#include <CGAL/number_utils.h> // 用于 to_double
+
+// 类型定义 - 严格按照 CGAL 文档顺序
+typedef CGAL::Exact_predicates_exact_constructions_kernel K;
+
+// 定义带 Info 的顶点类型
+typedef CGAL::Triangulation_vertex_base_with_info_3<size_t, K> Vb;
+// 定义默认的 Cell 类型
+typedef CGAL::Delaunay_triangulation_cell_base_3<K> Cb;
+// 定义数据结构 TDS
+typedef CGAL::Triangulation_data_structure_3<Vb, Cb> Tds;
+// 定义 Delaunay 三角剖分
+typedef CGAL::Delaunay_triangulation_3<K, Tds> Delaunay;
+
+// 简化常用类型名
+typedef Delaunay::Point Point_3;
+typedef Delaunay::Vertex_handle Vertex_handle;
+typedef Delaunay::Cell_handle Cell_handle;
+typedef Delaunay::Edge Edge;
+typedef K::Point_3 Point; // K::Point_3 和 Delaunay::Point 通常是一样的
+
+// ==========================================
+// 2. 辅助函数前置声明 (Forward Declarations)
+// ==========================================
+
+// 核心几何计算
+std::vector<Point_3> getVoronoiFace(const Delaunay& dt, Vertex_handle v1, Vertex_handle v2);
+
+// 各种导出函数
+void exportBoundarySurface(const Delaunay& dt, const std::map<Vertex_handle, int>& vertex_labels, const std::string& filename);
+void exportDelaunayBoundarySurface(const Delaunay& dt, const std::map<Vertex_handle, int>& vertex_labels, const std::string& filename);
+void exportBoundarySurfaceImproved(const Delaunay& dt, const std::map<Vertex_handle, int>& vertex_labels, const std::string& filename);
+void export_single_voronoi_polygon(const Delaunay& dt, Vertex_handle v1, Vertex_handle v2, const std::string& filename);
+
+// 底层 OBJ 写入函数
+void write_voronoi_facets_to_obj(const std::string& filename, const std::vector<std::vector<Point_3>>& voronoi_facets);
+void write_voronoi_facets_to_obj_dedup(const std::string& filename, const std::vector<std::vector<Point_3>>& voronoi_facets);
+void write_voronoi_facets_triangulated_obj(const std::string& filename, const std::vector<std::vector<Point_3>>& voronoi_facets);
+
+// ==========================================
+// 3. Generator 主接口实现
+// ==========================================
+
+void Generator::generate_surface_mesh(MeshingTree* seeds, const char* output_filename)
+{
+    std::cout << "[Generator] Starting surface mesh generation..." << std::endl;
+
+    size_t num_seeds = seeds->get_num_tree_points();
+    if (num_seeds == 0) {
+        std::cerr << "Error: No seeds provided." << std::endl;
+        return;
+    }
+
+    // --- 步骤 A: 构建 Delaunay 三角剖分 ---
+    Delaunay dt;
+    std::vector<Vertex_handle> vertex_handles(num_seeds);
+    std::map<Vertex_handle, int> vertex_labels; // 关键数据结构
+
+    std::cout << "  -> Building Delaunay triangulation..." << std::endl;
+    for (size_t i = 0; i < num_seeds; i++) {
+        if (!seeds->tree_point_is_active(i)) continue;
+        
+        double* pt = seeds->get_tree_point(i);
+        size_t* attrib = seeds->get_tree_point_attrib(i);
+        
+        // 插入点
+        Vertex_handle vh = dt.insert(Point_3(pt[0], pt[1], pt[2]));
+        vh->info() = i; // 存储原始索引
+        vertex_handles[i] = vh;
+
+        // 存储标签 (attrib[5] 为区域 ID)
+        int label = static_cast<int>(attrib[5]);
+        vertex_labels[vh] = label;
+    }
+    std::cout << "  -> DT vertices: " << dt.number_of_vertices() << std::endl;
+
+    // --- 步骤 B: 调用各种导出策略 ---
+
+    // 1. 调用改进版导出 (通常是你要的主要结果)
+    std::string main_output = output_filename; 
+    exportBoundarySurfaceImproved(dt, vertex_labels, main_output);
+
+    // 2. 导出 Delaunay 表面 (对偶表面，用于对比)
+    exportDelaunayBoundarySurface(dt, vertex_labels, "debug_delaunay_surface.obj");
+
+    // 3. 导出简易版边界表面 (用于对比)
+    exportBoundarySurface(dt, vertex_labels, "debug_boundary_simple.obj");
+
+    // --- 步骤 C: 提取并导出纯 Voronoi 面 (底层几何数据) ---
+    std::cout << "  -> Extracting raw Voronoi facets for component export..." << std::endl;
+    std::vector<std::vector<Point_3>> raw_facets;
+    
+    // 注意：使用 finite_edges_iterator
+    for (auto eit = dt.finite_edges_begin(); eit != dt.finite_edges_end(); ++eit) {
+        // eit 是 Edge 类型，本质上是 pair<Cell_handle, int> 的迭代器，解引用后得到 Edge
+        // 在 CGAL 这里的用法稍微复杂，Edge e = *eit; 
+        // 但我们可以直接通过 cell 和索引访问
+        Cell_handle c = eit->first;
+        int idx1 = eit->second;
+        int idx2 = eit->third;
+
+        Vertex_handle v1 = c->vertex(idx1);
+        Vertex_handle v2 = c->vertex(idx2);
+
+        // 检查标签是否存在
+        if (vertex_labels.find(v1) == vertex_labels.end() || vertex_labels.find(v2) == vertex_labels.end()) continue;
+
+        // 只提取边界上的 Voronoi 面 (不同标签之间)
+        if (vertex_labels.at(v1) != vertex_labels.at(v2)) {
+            std::vector<Point_3> face = getVoronoiFace(dt, v1, v2);
+            if (face.size() >= 3) {
+                raw_facets.push_back(face);
+            }
+        }
+    }
+
+    // 4. 调用底层写入函数
+    if (!raw_facets.empty()) {
+        write_voronoi_facets_to_obj("debug_facets_raw.obj", raw_facets);
+        write_voronoi_facets_to_obj_dedup("debug_facets_dedup.obj", raw_facets);
+        write_voronoi_facets_triangulated_obj("debug_facets_triangulated.obj", raw_facets);
+    }
+
+    std::cout << "[Generator] All tasks finished." << std::endl;
+}
+
+// ==========================================
+// 4. 辅助函数具体实现
+// ==========================================
+
+// 获取一条 Delaunay 边对应的 Voronoi 面顶点
+std::vector<Point_3> getVoronoiFace(const Delaunay& dt, Vertex_handle v1, Vertex_handle v2) {
+    std::vector<Point_3> face_vertices;
+    std::vector<Cell_handle> cells;
+    
+    // 获取围绕 v1 的所有四面体
+    dt.incident_cells(v1, std::back_inserter(cells));
+
+    for (const auto& cell : cells) {
+        if (dt.is_infinite(cell)) continue;
+        
+        // 检查该四面体是否也包含 v2
+        bool has_v2 = false;
+        for (int i = 0; i < 4; ++i) {
+            if (cell->vertex(i) == v2) {
+                has_v2 = true;
+                break;
+            }
+        }
+        
+        // 如果同时包含 v1 和 v2，则该四面体的对偶点（外心）是 Voronoi 面是一个顶点
+        if (has_v2) {
+            face_vertices.push_back(dt.dual(cell));
+        }
+    }
+    return face_vertices;
+}
+
+// 改进版边界导出
+void exportBoundarySurfaceImproved(const Delaunay& dt,
+    const std::map<Vertex_handle, int>& vertex_labels,
+    const std::string& filename) 
+{
+    std::cout << "\n[Export Improved] Processing " << filename << "..." << std::endl;
+    
+    std::vector<std::vector<Point_3>> voronoi_facets;
+    int boundary_edges_count = 0;
+
+    for (auto eit = dt.finite_edges_begin(); eit != dt.finite_edges_end(); ++eit) {
+        Cell_handle c = eit->first;
+        Vertex_handle v1 = c->vertex(eit->second);
+        Vertex_handle v2 = c->vertex(eit->third);
+
+        if (vertex_labels.count(v1) && vertex_labels.count(v2)) {
+            if (vertex_labels.at(v1) != vertex_labels.at(v2)) {
+                boundary_edges_count++;
+                std::vector<Point_3> face = getVoronoiFace(dt, v1, v2);
+                if (face.size() >= 3) {
+                    voronoi_facets.push_back(face);
+                }
+            }
+        }
+    }
+
+    std::cout << "  -> Found " << boundary_edges_count << " boundary edges." << std::endl;
+    std::cout << "  -> Generated " << voronoi_facets.size() << " valid Voronoi facets." << std::endl;
+
+    write_voronoi_facets_triangulated_obj(filename, voronoi_facets);
+}
+
+// 基础版边界导出
+void exportBoundarySurface(const Delaunay& dt,
+    const std::map<Vertex_handle, int>& vertex_labels,
+    const std::string& filename) 
+{
+    std::vector<std::vector<Point_3>> facets;
+    for (auto eit = dt.finite_edges_begin(); eit != dt.finite_edges_end(); ++eit) {
+        Cell_handle c = eit->first;
+        Vertex_handle v1 = c->vertex(eit->second);
+        Vertex_handle v2 = c->vertex(eit->third);
+        if (vertex_labels.count(v1) && vertex_labels.count(v2) && 
+            vertex_labels.at(v1) != vertex_labels.at(v2)) {
+            facets.push_back(getVoronoiFace(dt, v1, v2));
+        }
+    }
+    write_voronoi_facets_to_obj(filename, facets);
+}
+
+// 导出 Delaunay 边界
+void exportDelaunayBoundarySurface(const Delaunay& dt,
+    const std::map<Vertex_handle, int>& vertex_labels,
+    const std::string& filename) 
+{
+    std::ofstream out(filename);
+    if (!out) return;
+    out << "# Delaunay Boundary Surface\n";
+    
+    std::set<Point_3> unique_points;
+    std::vector<std::array<Point_3, 3>> triangles;
+
+    for (auto fit = dt.finite_facets_begin(); fit != dt.finite_facets_end(); ++fit) {
+        Cell_handle c1 = fit->first;
+        int idx = fit->second;
+        Cell_handle c2 = c1->neighbor(idx);
+
+        if (dt.is_infinite(c1) || dt.is_infinite(c2)) continue;
+
+        std::set<int> labels;
+        for(int i=0; i<4; ++i) if(vertex_labels.count(c1->vertex(i))) labels.insert(vertex_labels.at(c1->vertex(i)));
+        for(int i=0; i<4; ++i) if(vertex_labels.count(c2->vertex(i))) labels.insert(vertex_labels.at(c2->vertex(i)));
+
+        if (labels.size() > 1) {
+            std::array<Point_3, 3> tri;
+            int t = 0;
+            for(int i=0; i<4; ++i) {
+                if(i != idx) tri[t++] = c1->vertex(i)->point();
+            }
+            triangles.push_back(tri);
+            unique_points.insert(tri[0]); unique_points.insert(tri[1]); unique_points.insert(tri[2]);
+        }
+    }
+
+    std::map<Point_3, int> p_idx;
+    int i = 1;
+    out << std::fixed << std::setprecision(10);
+    for(const auto& p : unique_points) {
+        p_idx[p] = i++;
+        out << "v " << CGAL::to_double(p.x()) << " " << CGAL::to_double(p.y()) << " " << CGAL::to_double(p.z()) << "\n";
+    }
+    for(const auto& tri : triangles) {
+        out << "f " << p_idx[tri[0]] << " " << p_idx[tri[1]] << " " << p_idx[tri[2]] << "\n";
+    }
+}
+
+// 导出单个多边形
+void export_single_voronoi_polygon(const Delaunay& dt, Vertex_handle v1, Vertex_handle v2, const std::string& filename) {
+    std::vector<Point_3> face = getVoronoiFace(dt, v1, v2);
+    if (face.size() < 3) return;
+    std::vector<std::vector<Point_3>> wrapper = { face };
+    write_voronoi_facets_to_obj(filename, wrapper);
+}
+
+// --- 写入函数实现 ---
+
+// 1. 基础写入
+void write_voronoi_facets_to_obj(const std::string& filename, const std::vector<std::vector<Point_3>>& voronoi_facets) {
+    std::ofstream out(filename);
+    if(!out) return;
+    out << "# Raw Voronoi Facets\n";
+    out << std::fixed << std::setprecision(10);
+    int v_offset = 1;
+    for(const auto& f : voronoi_facets) {
+        if(f.size() < 3) continue;
+        for(const auto& p : f) out << "v " << CGAL::to_double(p.x()) << " " << CGAL::to_double(p.y()) << " " << CGAL::to_double(p.z()) << "\n";
+        out << "f";
+        for(size_t i=0; i<f.size(); ++i) out << " " << v_offset + i;
+        out << "\n";
+        v_offset += f.size();
+    }
+}
+
+// 2. 顶点去重写入
+void write_voronoi_facets_to_obj_dedup(const std::string& filename, const std::vector<std::vector<Point_3>>& voronoi_facets) {
+    std::ofstream out(filename);
+    if(!out) return;
+    out << "# Deduplicated Voronoi Facets\n";
+    out << std::fixed << std::setprecision(10);
+    
+    std::map<std::tuple<long long,long long,long long>, int> v_map;
+    std::vector<Point_3> unique_v;
+    std::vector<std::vector<int>> faces_indices;
+
+    auto get_idx = [&](const Point_3& p) {
+        // 使用 long long 防止精度问题导致的 map key 不一致
+        auto key = std::make_tuple(
+            (long long)std::round(CGAL::to_double(p.x())*1e8), 
+            (long long)std::round(CGAL::to_double(p.y())*1e8), 
+            (long long)std::round(CGAL::to_double(p.z())*1e8));
+        if(v_map.count(key)) return v_map[key];
+        int idx = unique_v.size() + 1;
+        v_map[key] = idx;
+        unique_v.push_back(p);
+        return idx;
+    };
+
+    for(const auto& f : voronoi_facets) {
+        if(f.size()<3) continue;
+        std::vector<int> face_idx;
+        for(const auto& p : f) face_idx.push_back(get_idx(p));
+        faces_indices.push_back(face_idx);
+    }
+
+    for(const auto& p : unique_v) out << "v " << CGAL::to_double(p.x()) << " " << CGAL::to_double(p.y()) << " " << CGAL::to_double(p.z()) << "\n";
+    for(const auto& idxs : faces_indices) {
+        out << "f";
+        for(int id : idxs) out << " " << id;
+        out << "\n";
+    }
+}
+
+// 3. 三角化写入
+void write_voronoi_facets_triangulated_obj(const std::string& filename, const std::vector<std::vector<Point_3>>& voronoi_facets) {
+    std::ofstream out(filename);
+    if(!out) return;
+    out << "# Triangulated Voronoi Facets\n";
+    out << std::fixed << std::setprecision(10);
+
+    std::map<std::tuple<long long,long long,long long>, int> v_map;
+    std::vector<Point_3> unique_v;
+    
+    auto get_idx = [&](const Point_3& p) {
+        auto key = std::make_tuple(
+            (long long)std::round(CGAL::to_double(p.x())*1e8), 
+            (long long)std::round(CGAL::to_double(p.y())*1e8), 
+            (long long)std::round(CGAL::to_double(p.z())*1e8));
+        if(v_map.count(key)) return v_map[key];
+        int idx = unique_v.size() + 1;
+        v_map[key] = idx;
+        unique_v.push_back(p);
+        return idx;
+    };
+
+    std::vector<std::array<int,3>> tris;
+
+    for(const auto& f : voronoi_facets) {
+        if(f.size() < 3) continue;
+        
+        double cx=0, cy=0, cz=0;
+        for(const auto& p : f) { cx+=CGAL::to_double(p.x()); cy+=CGAL::to_double(p.y()); cz+=CGAL::to_double(p.z()); }
+        Point_3 center(cx/f.size(), cy/f.size(), cz/f.size());
+        int c_idx = get_idx(center);
+
+        std::vector<int> f_idxs;
+        for(const auto& p : f) f_idxs.push_back(get_idx(p));
+
+        for(size_t i=0; i<f_idxs.size(); ++i) {
+            int idx1 = f_idxs[i];
+            int idx2 = f_idxs[(i+1)%f_idxs.size()];
+            if(idx1 == idx2) continue; 
+            tris.push_back({c_idx, idx1, idx2});
+        }
+    }
+
+    for(const auto& p : unique_v) out << "v " << CGAL::to_double(p.x()) << " " << CGAL::to_double(p.y()) << " " << CGAL::to_double(p.z()) << "\n";
+    for(const auto& t : tris) out << "f " << t[0] << " " << t[1] << " " << t[2] << "\n";
+}

@@ -42,9 +42,9 @@ int MeshingTree::add_tree_point(size_t num_dim, double* x, double* normal, size_
 {
 	
     _num_dim = static_cast<int>(num_dim);
-    if (_xmin.empty())
+    if (_xmin.size() < num_dim)
         _xmin.assign(num_dim, DBL_MAX);
-    if (_xmax.empty())
+    if (_xmax.size() < num_dim)
         _xmax.assign(num_dim, -DBL_MAX);
 
     for (size_t idim = 0; idim < num_dim; idim++)

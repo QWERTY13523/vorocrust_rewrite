@@ -15,8 +15,8 @@ int main()
     MeshingTree *seeds = new MeshingTree();
     size_t num_points, num_faces, num_faces1;
     generator.read_input_obj_file("./data/obj/block.obj",num_points,points,num_faces,faces);
-    generator.generate_spheres("./data/spheres/Sphere_6000_55.csv", spheres);
-    generator.read_obj_faces("/home/yiming/research/vorocrust/data/obj/Ours_6000_block_Remesh.obj",face_flat, num_faces1);
+    generator.generate_spheres("./data/spheres/Sphere_6000_55_block.csv", spheres);
+    generator.read_obj_faces("./data/obj/Ours_6000_block_Remesh.obj",face_flat, num_faces1);
     generator.generate_surface_seeds(num_points, points, num_faces, faces,
          spheres, upper_seeds, lower_seeds);
     generator.color_surface_seeds(num_faces1, spheres,upper_seeds, lower_seeds, seeds,

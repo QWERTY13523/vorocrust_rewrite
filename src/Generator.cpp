@@ -126,45 +126,49 @@ int Generator::read_input_obj_file(std::string filename, size_t &num_points, dou
 void Generator::generate_spheres(const char* filename, MeshingTree *&spheres)
 {
     std::ifstream fin(filename);
-  if (!fin) {
-    std::cerr << "open failed: " << filename << "\n";
-    return;
-  }
-
-  std::string line;
-  if (std::getline(fin, line)) { // 跳表头（若无表头会回退）
-    if (line.find("x") == std::string::npos) {
-      fin.clear();
-      fin.seekg(0);
+    if (!fin) {
+        std::cerr << "open failed: " << filename << "\n";
+        return;
     }
-  }
 
-  size_t count = 0;
-  while (std::getline(fin, line)) {
-    if (line.empty())
-      continue;
-    for (char &c : line)
-      if (c == ',')
-        c = ' ';
-    std::istringstream ss(line);
-
-    double x, y, z, r;
-    int fid;
-    if (!(ss >> x >> y >> z >> r >> fid))
-      continue;
-    double nx = 0.0, ny = 0.0, nz = 0.0;
-    if (!(ss >> nx >> ny >> nz)) {
-      nx = 0.0;
-      ny = 0.0;
-      nz = 0.0;
+    std::string line;
+    if (std::getline(fin, line)) { 
+        if (line.find("x") == std::string::npos) {
+            fin.clear();
+            fin.seekg(0);
+        }
     }
-    double s[4] = {x, y, z, r};
-    double n[4] = {nx, ny, nz, 0.0};
-    size_t attrib[3] = {2, 0, count + 1}; // {长度, 来源面索引(占位或真实面号)}
-    attrib[1] = fid;
-    spheres->add_tree_point(4, s, n, attrib);
-    ++count;
-  }
+
+    size_t count = 0;
+    while (std::getline(fin, line)) {
+        if (line.empty()) {
+            continue;
+        }
+        for (char &c : line) {
+            if (c == ',') {
+                c = ' ';
+            }
+        }
+        std::istringstream ss(line);
+
+        double x = 0.0, y = 0.0, z = 0.0, r = 0.0;
+        int fid = 0;
+        if (!(ss >> x >> y >> z >> r >> fid)) {
+            continue;
+        }
+        double nx = 0.0, ny = 0.0, nz = 0.0;
+        if (!(ss >> nx >> ny >> nz)) {
+            nx = 0.0;
+            ny = 0.0;
+            nz = 0.0;
+        }
+        double s[4] = {x, y, z, r};
+        double n[4] = {nx, ny, nz, 0.0};
+        size_t attrib[3] = {2, 0, count + 1}; 
+        attrib[1] = static_cast<size_t>(fid);
+        spheres->add_tree_point(4, s, n, attrib);
+        ++count;
+    }
 }
 
 void Generator::read_obj_faces(const char* filename, std::vector<int>& faces_flat, size_t& num_faces)
