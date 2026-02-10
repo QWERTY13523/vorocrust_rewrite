@@ -13,7 +13,7 @@ int Methods::get_overlapping_spheres(double* sphere, MeshingTree* spheres,
 
 	size_t iclosest; double hclosest(DBL_MAX);
 	spheres->get_closest_tree_point(sphere, iclosest, hclosest);
-	double rclosest = spheres->get_tree_point_attrib(iclosest, 0);
+	double rclosest = spheres->get_tree_point(iclosest)[3];
 
 	double r = rclosest + 3 * hclosest;
 	if (r < sphere[3]) r = sphere[3];
@@ -63,7 +63,7 @@ bool Methods::point_covered(double* point, MeshingTree* spheres, double alpha_co
 	size_t closest_sphere; double closest_dst(DBL_MAX);
 	spheres->get_closest_tree_point(point, closest_sphere, closest_dst);
 
-	double closest_sphere_radius = spheres->get_tree_point_attrib(closest_sphere, 0);
+	double closest_sphere_radius = spheres->get_tree_point(closest_sphere)[3];
 
 	double estimated_face_center_radius = closest_sphere_radius + 0.5 * closest_dst;
 

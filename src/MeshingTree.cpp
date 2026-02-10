@@ -7,6 +7,12 @@ MeshingTree::MeshingTree()
     _xmin.assign(3,DBL_MAX);
     _xmax.assign(3,-DBL_MAX);
     _num_dim = 0;
+    _capacity = 0;
+    _tree_root = 0;
+    _tree_max_height = 0;
+    _auto_balance = true;
+    _marked_only = false;
+    _is_redundant = false;
 }
 
 int MeshingTree::graph_connect_nodes(size_t ipoint, size_t jpoint)

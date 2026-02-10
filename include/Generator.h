@@ -23,6 +23,8 @@ public:
     //void generate_connections(const char* filename, std::vector<std::vector<std::tuple<size_t,size_t,size_t>>> &connections);
     void generate_surface_seeds(size_t num_points, double **points, size_t num_faces, size_t **faces,
          MeshingTree *surface_spheres,MeshingTree *upper_seeds, MeshingTree *lower_seeds);
+    void generate_surface_seeds(size_t num_points, double **points, size_t num_faces, size_t **faces,
+         MeshingTree *spheres,MeshingTree *upper_seeds, MeshingTree *lower_seeds, size_t number_of_facets, std::vector<int> faces_flat);
     void color_surface_seeds(
         int num_faces, 
         MeshingTree *surface_spheres, 

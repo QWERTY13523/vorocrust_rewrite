@@ -211,54 +211,146 @@ void Generator::read_obj_faces(const char* filename, std::vector<int>& faces_fla
 	num_faces = static_cast<int>(faces_flat.size() / 3);
 }
 
-// void Generator::generate_connections(const char* filename, std::vector<std::vector<std::tuple<size_t,size_t,size_t>>> &connections)
-// {
-//     std::ifstream fin(filename);
-//     if (!fin) {
-//         std::cerr << "Failed to open OBJ file: " << filename << "\n";
-//         return;
-//     }
+void Generator::generate_surface_seeds(size_t num_points, double **points, size_t num_faces, size_t **faces,
+         MeshingTree *spheres,MeshingTree *upper_seeds, MeshingTree *lower_seeds, size_t number_of_facets, std::vector<int> faces_flat)
+{
+    double* sphere = new double[4];
 
-//     std::vector<std::vector<size_t>> faces;
-//     std::string line;
-//     while (std::getline(fin, line)) {
-//         if (line.empty() || line[0] != 'f') continue;
-//         std::istringstream ss(line);
-//         std::string token;
-//         ss >> token; // skip 'f'
-//         std::vector<size_t> face;
-//         while (ss >> token) {
-//             size_t pos = token.find('/');
-//             size_t vid = std::stoul(token.substr(0, pos));
-//             face.push_back(vid - 1); // convert to 0-based
-//         }
-//         if (face.size() == 3) faces.push_back(face);
-//     }
+    double* sphere_i = new double[4];
+    double* sphere_j = new double[4];
+    double* sphere_k = new double[4];
 
-//     // Build vertex -> faces map
-//     std::vector<std::vector<size_t>> vertex_to_faces;
-//     for (const auto& f : faces) {
-//         for (size_t v : f) {
-//             if (vertex_to_faces.size() <= v) vertex_to_faces.resize(v + 1);
-//             vertex_to_faces[v].push_back(&f - &faces[0]);
-//         }
-//     }
+    double* c_ijk = new double[3];
+    double** centers = new double*[3];
+    double* radii = new double[3];
+    double* triplet_normal = new double[3];
+    double* upper_seed = new double[4];
+    double* lower_seed = new double[4];
+    std::vector<size_t> attrib;
+    attrib.resize(6);
+    attrib[0] = 6, attrib[5] = 0;
 
-//     // Build face adjacency via shared vertices, store full vertex triples as tuples
-//     connections.resize(faces.size());
-//     for (size_t i = 0; i < faces.size(); ++i) {
-//         std::unordered_set<size_t> neighbor_indices;
-//         for (size_t v : faces[i]) {
-//             for (size_t adj : vertex_to_faces[v]) {
-//                 if (adj != i) neighbor_indices.insert(adj);
-//             }
-//         }
-//         // Convert neighbor indices to full vertex triples as tuples
-//         for (size_t adj : neighbor_indices) {
-//             connections[i].emplace_back(faces[adj][0], faces[adj][1], faces[adj][2]);
-//         }
-//     }
-// }
+    for(int i = 0; i < number_of_facets; i++)
+    {
+        int i_sphere = faces_flat[i * 3], j_sphere = faces_flat[i * 3 + 1], k_sphere = faces_flat[i * 3 + 2];
+        double sphere_i[4];
+        spheres->get_tree_point(i_sphere, 4, sphere_i);
+        size_t sphere_i_face;
+        spheres->get_tree_point_attrib(i_sphere, 0, sphere_i_face);
+
+        spheres->get_tree_point(j_sphere, 4, sphere_j);
+        double dst_ij = _geom.distance(3, sphere_i, sphere_j);
+        if (dst_ij > sphere_i[3] + sphere_j[3] - 1E-10)
+            continue;
+
+         spheres->get_tree_point(k_sphere, 4, sphere_k);
+
+        double dst_ik = _geom.distance(3, sphere_i, sphere_k);
+        if (dst_ik > sphere_i[3] + sphere_k[3] - 1E-10)
+            continue;
+
+        double dst_jk = _geom.distance(3, sphere_j, sphere_k);
+        if (dst_jk > sphere_j[3] + sphere_k[3] - 1E-10)
+            continue;
+
+        centers[0] = sphere_i; centers[1] = sphere_j; centers[2] = sphere_k;
+        radii[0] = sphere_i[3]; radii[1] = sphere_j[3]; radii[2] = sphere_k[3];
+        
+        // Debug: check power vertex calculation
+        bool pv_valid = _geom.get_power_vertex(3, 3, centers, radii, c_ijk);
+        if (!pv_valid) {
+            std::cout << "Power vertex calculation failed for spheres " 
+                        << i_sphere << ", " << j_sphere << ", " << k_sphere << std::endl;
+            continue;
+        }
+        
+        // Debug: verify distances from power vertex to each sphere center
+        double hi = _geom.distance(3, c_ijk, sphere_i);
+        double hj = _geom.distance(3, c_ijk, sphere_j);
+        double hk = _geom.distance(3, c_ijk, sphere_k);
+        if (hi > sphere_i[3] - 1E-10) continue;
+
+        double vi = sqrt(sphere_i[3] * sphere_i[3] - hi * hi);
+
+        // Three overlapping spheres with an intersection pair
+        double area = _geom.get_3d_triangle_area(centers);
+
+        if (area < 1E-10)
+            continue; // spheres are colinear
+
+        _geom.get_3d_triangle_normal(centers, triplet_normal);
+
+        // adjust triplet normal
+
+        size_t fi_i1 = faces[sphere_i_face][1];
+        size_t fi_i2 = faces[sphere_i_face][2];
+        size_t fi_i3 = faces[sphere_i_face][3];
+        double** fi_corners = new double*[3];
+        fi_corners[0] = points[fi_i1]; fi_corners[1] = points[fi_i2], fi_corners[2] = points[fi_i3];
+        double* fi_normal = new double[3];
+        _geom.get_3d_triangle_normal(fi_corners, fi_normal);
+
+        double dot = _geom.dot_product(3, fi_normal, triplet_normal);
+        delete[] fi_normal; delete[] fi_corners;
+        
+        // Check for sliver detection
+        
+        if (dot < 0.0)
+        {
+            attrib[2] = i_sphere;
+            attrib[3] = k_sphere;
+            attrib[4] = j_sphere;
+            for (size_t idim = 0; idim < 3; idim++) triplet_normal[idim] = -triplet_normal[idim];
+        }
+        else
+        {
+            attrib[2] = i_sphere;
+            attrib[3] = j_sphere;
+            attrib[4] = k_sphere;
+        }
+
+        for (size_t idim = 0; idim < 3; idim++)
+        {
+            upper_seed[idim] = c_ijk[idim] + vi * triplet_normal[idim];
+            lower_seed[idim] = c_ijk[idim] - vi * triplet_normal[idim];
+        }
+
+        #pragma region A valid Intersection Pairs:
+        size_t iclosest; double hclosest(DBL_MAX);
+        size_t upper_seed_index(upper_seeds->get_num_tree_points());
+        size_t lower_seed_index(lower_seeds->get_num_tree_points());
+
+        lower_seeds->get_closest_tree_point(lower_seed, iclosest, hclosest);
+        if (hclosest < 1E-10) lower_seed_index = iclosest;
+
+        hclosest = DBL_MAX;
+        upper_seeds->get_closest_tree_point(upper_seed, iclosest, hclosest);
+        if (hclosest < 1E-10) upper_seed_index = iclosest;
+
+        if (lower_seed_index == lower_seeds->get_num_tree_points())
+        {
+            lower_seed[3] = fmin(sphere_i[3], sphere_j[3]);
+            lower_seed[3] = fmin(lower_seed[3], sphere_k[3]);
+
+            attrib[1] = upper_seed_index;
+            lower_seeds->add_tree_point(4, lower_seed, triplet_normal, attrib.data());
+        }
+
+        if (upper_seed_index == upper_seeds->get_num_tree_points())
+        {
+            upper_seed[3] = fmin(sphere_i[3], sphere_j[3]);
+            upper_seed[3] = fmin(upper_seed[3], sphere_k[3]);
+
+            attrib[1] = lower_seed_index;
+            upper_seeds->add_tree_point(4, upper_seed, triplet_normal, attrib.data());
+        }
+        #pragma endregion
+    }
+    delete[] sphere;
+    delete[] sphere_i; delete[] sphere_j; delete[] sphere_k;
+    delete[] c_ijk; delete[] centers; delete[] radii;
+    delete[] triplet_normal; delete[] upper_seed; delete[] lower_seed;
+}
 void Generator::generate_surface_seeds(size_t num_points, double **points, size_t num_faces, size_t **faces,
          MeshingTree *spheres,MeshingTree *upper_seeds, MeshingTree *lower_seeds)
 {
@@ -613,6 +705,16 @@ void Generator::color_surface_seeds(int num_faces, MeshingTree *surface_spheres,
 
         std::unordered_set<std::array<size_t, 3>, FaceKeyHash> face_set;
         face_set.reserve(static_cast<size_t>(num_faces) * 2);
+        for (int i = 0; i < num_faces; i++)
+        {
+            size_t a = static_cast<size_t>(face[3 * i + 0]);
+            size_t b = static_cast<size_t>(face[3 * i + 1]);
+            size_t c = static_cast<size_t>(face[3 * i + 2]);
+            std::array<size_t, 3> key{ a, b, c };
+            std::sort(key.begin(), key.end());
+            face_set.insert(key);
+        }
+
         for (size_t iseed = 0; iseed < num_seeds; iseed++)
         {
             if (!seeds->tree_point_is_active(iseed)) continue;
@@ -624,8 +726,12 @@ void Generator::color_surface_seeds(int num_faces, MeshingTree *surface_spheres,
 
             std::array<size_t, 3> key{ attrib[2], attrib[3], attrib[4] };
             std::sort(key.begin(), key.end());
+            // if(key[0]==723 && key[1]==778 && key[2]==1989){
+            //     std::cout<<"Found sliver!"<<std::endl;
+            // }    
             if(face_set.find(key) == face_set.end())
             {
+                // std::cout<<key[0]<<" "<<key[1]<<" "<<key[2]<<std::endl;
                 seeds->lazy_delete_tree_point(iseed);
                 seeds->lazy_delete_tree_point(jseed);
             }
@@ -1079,13 +1185,13 @@ void Generator::generate_seed_csv(const char* filename, int num_dim, size_t num_
 			file << std::setprecision(16) << spheres[i * num_dim];
 			for (size_t idim = 1; idim < num_dim; idim++) file << ", " << spheres[i * num_dim + idim];
 			file << ", " << spheres_sizing[i];
-			if (spheres_region_id != 0) file << ", " << spheres_region_id[i] - 1;
+			if (spheres_region_id != 0) file << ", " << spheres_region_id[i];
 		}
 		else
 		{
 			file << std::setprecision(16) << spheres[i * (num_dim + 1)];
 			for (size_t idim = 1; idim <= num_dim; idim++) file << ", " << spheres[i * (num_dim + 1) + idim];
-			if (spheres_region_id != 0) file << ", " << spheres_region_id[i] - 1;
+			if (spheres_region_id != 0) file << ", " << spheres_region_id[i];
 		}
 		file << std::endl;
 	}
