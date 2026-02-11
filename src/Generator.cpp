@@ -482,62 +482,128 @@ void Generator::generate_surface_seeds(size_t num_points, double **points, size_
                 size_t* covering_spheres1 = new size_t[cap],*covering_spheres2 = new size_t[cap];
                 bool upper_covered = _methods.point_covered(upper_seed, spheres, 0.0, sphere_index_i, sphere_index_j, sphere_index_k, num1, cap, covering_spheres1);
                 bool lower_covered = _methods.point_covered(lower_seed, spheres, 0.0, sphere_index_i, sphere_index_j, sphere_index_k, num2, cap, covering_spheres2);
-				delete[] covering_spheres1;delete[] covering_spheres2;
-                if(upper_covered && lower_covered)continue;
-                if(upper_covered != lower_covered)
-                {
-                    // std::cout << "Sliver! caused by spheres " << sphere_index_i << " " << sphere_index_j << " " << sphere_index_k << std::endl;
-                    // for(int i=0;i<3;i++)
-                    // {
-                    //     std::cout<<upper_seed[i]<<" ";
-                    // }
-                    // std::cout<<std::endl;
-                    // for(int i=0;i<3;i++)
-                    // {
-                    //     std::cout<<lower_seed[i]<<" ";
-                    // }
-                    // std::cout<<std::endl;
-                    
-                    // Get sphere centers for the three spheres causing the sliver
-                    double sphere_i_center[4], sphere_j_center[4], sphere_k_center[4];
-                    spheres->get_tree_point(sphere_index_i, 4, sphere_i_center);
-                    spheres->get_tree_point(sphere_index_j, 4, sphere_j_center);
-                    spheres->get_tree_point(sphere_index_k, 4, sphere_k_center);
-                    
-                    // Output sliver points and sphere centers to OBJ file
-                    std::ofstream sliver_file("sliver_points.obj", std::ios::app);
-                    if (sliver_file.is_open()) {
-                        // Write upper seed point (red)
-                        sliver_file << "v " << upper_seed[0] << " " << upper_seed[1] << " " << upper_seed[2] << " 1.0 0.0 0.0" << std::endl;
-                        // Write lower seed point (blue)
-                        sliver_file << "v " << lower_seed[0] << " " << lower_seed[1] << " " << lower_seed[2] << " 0.0 0.0 1.0" << std::endl;
-                        // Write sphere centers (green)
-                        sliver_file << "v " << sphere_i_center[0] << " " << sphere_i_center[1] << " " << sphere_i_center[2] << " 0.0 1.0 0.0" << std::endl;
-                        sliver_file << "v " << sphere_j_center[0] << " " << sphere_j_center[1] << " " << sphere_j_center[2] << " 0.0 1.0 0.0" << std::endl;
-                        sliver_file << "v " << sphere_k_center[0] << " " << sphere_k_center[1] << " " << sphere_k_center[2] << " 0.0 1.0 0.0" << std::endl;
-                        
-                        // Write triangle formed by the three sphere centers (yellow)
-                        // Get current vertex count for face indexing
-                        static int vertex_count = 0;
-                        if (vertex_count == 0) {
-                            // Count existing vertices in file
-                            std::ifstream count_file("sliver_points.obj");
-                            std::string line;
-                            while (std::getline(count_file, line)) {
-                                if (line.substr(0, 2) == "v ") {
-                                    vertex_count++;
-                                }
-                            }
-                            count_file.close();
-                        }
-                        
-                        // Write triangle face using the last 3 vertices (sphere centers)
-                        sliver_file << "f " << (vertex_count - 2) << " " << (vertex_count - 1) << " " << vertex_count << std::endl;
-                        vertex_count += 5; // 2 seed points + 3 sphere centers
-                        
-                        sliver_file.close();
-                    }
-                }
+                if(upper_covered || lower_covered){ delete[] covering_spheres1; delete[] covering_spheres2; continue; }
+
+                // Sliver resolution: shrink least-impactful sphere to minimum viable radius
+                // if(upper_covered != lower_covered)
+                // {
+                //     bool sliver_triplet_invalid = false;
+                //     const int max_sliver_iters = 5;
+                //     for (int sliver_iter = 0; sliver_iter < max_sliver_iters; sliver_iter++)
+                //     {
+                //         // Identify the 4th sphere (the one covering a seed)
+                //         size_t fourth_sphere = SIZE_MAX;
+                //         if (upper_covered && num1 > 0) fourth_sphere = covering_spheres1[0];
+                //         else if (lower_covered && num2 > 0) fourth_sphere = covering_spheres2[0];
+                //         if (fourth_sphere == SIZE_MAX) break;
+
+                //         // The four candidate spheres involved in the sliver
+                //         size_t candidates[4] = {sphere_index_i, sphere_index_j, sphere_index_k, fourth_sphere};
+
+                //         // Find the sphere with fewest overlapping neighbors (least impact)
+                //         int best_idx = -1;
+                //         size_t min_neighbor_count = SIZE_MAX;
+                //         for (int c = 0; c < 4; c++)
+                //         {
+                //             double cs[4];
+                //             spheres->get_tree_point(candidates[c], 4, cs);
+                //             size_t n_overlap = 0;
+                //             size_t* overlap_list = nullptr;
+                //             _methods.get_overlapping_spheres(cs, spheres, n_overlap, overlap_list);
+                //             if (n_overlap < min_neighbor_count) {
+                //                 min_neighbor_count = n_overlap;
+                //                 best_idx = c;
+                //             }
+                //             delete[] overlap_list;
+                //         }
+                //         if (best_idx < 0) break;
+
+                //         // Compute the minimum radius that still intersects all neighbors
+                //         size_t shrink_idx = candidates[best_idx];
+                //         double shrink_sp[4];
+                //         spheres->get_tree_point(shrink_idx, 4, shrink_sp);
+                //         size_t n_overlap = 0;
+                //         size_t* overlap_list = nullptr;
+                //         _methods.get_overlapping_spheres(shrink_sp, spheres, n_overlap, overlap_list);
+
+                //         double min_viable_radius = 1E-10;
+                //         for (size_t n = 0; n < n_overlap; n++)
+                //         {
+                //             if (overlap_list[n] == shrink_idx) continue;
+                //             double ns[4];
+                //             spheres->get_tree_point(overlap_list[n], 4, ns);
+                //             double d = _geom.distance(3, shrink_sp, ns);
+                //             double required = d - ns[3] + 1E-10;
+                //             if (required > min_viable_radius) min_viable_radius = required;
+                //         }
+                //         delete[] overlap_list;
+
+                //         // Shrink the sphere radius
+                //         spheres->get_tree_point(shrink_idx)[3] = min_viable_radius;
+
+                //         // Reload triplet sphere data after shrinking
+                //         spheres->get_tree_point(sphere_index_i, 4, sphere_i);
+                //         spheres->get_tree_point(sphere_index_j, 4, sphere_j);
+                //         spheres->get_tree_point(sphere_index_k, 4, sphere_k);
+
+                //         // Check if triplet still overlaps after shrinking
+                //         if (_geom.distance(3, sphere_i, sphere_j) > sphere_i[3] + sphere_j[3] - 1E-10 ||
+                //             _geom.distance(3, sphere_i, sphere_k) > sphere_i[3] + sphere_k[3] - 1E-10 ||
+                //             _geom.distance(3, sphere_j, sphere_k) > sphere_j[3] + sphere_k[3] - 1E-10)
+                //         { sliver_triplet_invalid = true; break; }
+
+                //         // Recompute power vertex
+                //         centers[0] = sphere_i; centers[1] = sphere_j; centers[2] = sphere_k;
+                //         radii[0] = sphere_i[3]; radii[1] = sphere_j[3]; radii[2] = sphere_k[3];
+                //         if (!_geom.get_power_vertex(3, 3, centers, radii, c_ijk))
+                //         { sliver_triplet_invalid = true; break; }
+
+                //         double new_hi = _geom.distance(3, c_ijk, sphere_i);
+                //         if (new_hi > sphere_i[3] - 1E-10)
+                //         { sliver_triplet_invalid = true; break; }
+                //         double new_vi = sqrt(sphere_i[3] * sphere_i[3] - new_hi * new_hi);
+
+                //         if (_geom.get_3d_triangle_area(centers) < 1E-10)
+                //         { sliver_triplet_invalid = true; break; }
+
+                //         _geom.get_3d_triangle_normal(centers, triplet_normal);
+
+                //         // Re-adjust triplet normal direction
+                //         double** fc = new double*[3];
+                //         fc[0] = points[fi_i1]; fc[1] = points[fi_i2]; fc[2] = points[fi_i3];
+                //         double* fn = new double[3];
+                //         _geom.get_3d_triangle_normal(fc, fn);
+                //         double nd = _geom.dot_product(3, fn, triplet_normal);
+                //         delete[] fn; delete[] fc;
+
+                //         if (nd < 0.0) {
+                //             attrib[2] = sphere_index_i; attrib[3] = sphere_index_k; attrib[4] = sphere_index_j;
+                //             for (size_t idim = 0; idim < 3; idim++) triplet_normal[idim] = -triplet_normal[idim];
+                //         } else {
+                //             attrib[2] = sphere_index_i; attrib[3] = sphere_index_j; attrib[4] = sphere_index_k;
+                //         }
+
+                //         for (size_t idim = 0; idim < 3; idim++)
+                //         {
+                //             upper_seed[idim] = c_ijk[idim] + new_vi * triplet_normal[idim];
+                //             lower_seed[idim] = c_ijk[idim] - new_vi * triplet_normal[idim];
+                //         }
+
+                //         // Re-check coverage after recomputation
+                //         delete[] covering_spheres1; delete[] covering_spheres2;
+                //         num1 = 0; num2 = 0;
+                //         covering_spheres1 = new size_t[cap]; covering_spheres2 = new size_t[cap];
+                //         upper_covered = _methods.point_covered(upper_seed, spheres, 0.0, sphere_index_i, sphere_index_j, sphere_index_k, num1, cap, covering_spheres1);
+                //         lower_covered = _methods.point_covered(lower_seed, spheres, 0.0, sphere_index_i, sphere_index_j, sphere_index_k, num2, cap, covering_spheres2);
+
+                //         if (upper_covered && lower_covered) break;
+                //         if (upper_covered == lower_covered) break; // Both uncovered - sliver resolved
+                //     }
+
+                //     if (sliver_triplet_invalid || (upper_covered && lower_covered))
+                //     { delete[] covering_spheres1; delete[] covering_spheres2; continue; }
+                // }
+                delete[] covering_spheres1; delete[] covering_spheres2;
                 #pragma region A valid Intersection Pairs:
                 size_t iclosest; double hclosest(DBL_MAX);
                 size_t upper_seed_index(upper_seeds->get_num_tree_points());

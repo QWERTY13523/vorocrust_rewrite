@@ -37,6 +37,7 @@ public:
         size_t* &seeds_region_id, 
         double* &seeds_sizing
     );
+    void ensure_seed_pair_adjacency(MeshingTree* seeds);
     void generate_surface_mesh(MeshingTree* seeds, const char* output_filename);
     void generate_surface_mesh1(MeshingTree* seeds, const char* output_filename);
     void generate_seed_csv(
