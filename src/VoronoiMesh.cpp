@@ -4,6 +4,7 @@
 #include <cmath>
 #include <map>
 #include <fstream>
+#include <random>
 #include <iomanip>
 #include <set>
 #include <string>
@@ -27,91 +28,255 @@ typedef K::Point_3 Point;
 
 // =========================================================
 // ensure_seed_pair_adjacency:
-//   妫€娴嬪苟淇绉嶅瓙瀵圭殑 Delaunay 閭绘帴鎬с€?
-//   褰撻厤瀵圭瀛?(A, B) 涔嬮棿琚涓夎€?C 鎻掑叆瀵艰嚧 Delaunay 杈规柇瑁傛椂锛?
-//   灏?A 鍜?B 娌胯繛绾垮悜涓偣鏀剁缉锛岀缉灏忓寘鍥寸悆浠ユ帓闄ゅ叆渚佃€呫€?
-//   涓偣锛堜綅浜庢洸闈笂锛変繚鎸佷笉鍙橈紝鍥犳涓嶅奖鍝嶆洸闈㈤€艰繎绮惧害銆?
 // =========================================================
-void Generator::ensure_seed_pair_adjacency(MeshingTree* seeds)
-{
-    std::cout << "[Generator] Repairing seed pair adjacency (contraction method)..." << std::endl;
+
+double calc_bbox_diag_tree(MeshingTree* seeds) {
+    size_t num_seeds = seeds->get_num_tree_points();
+    double min_x = 1e30, max_x = -1e30;
+    double min_y = 1e30, max_y = -1e30;
+    double min_z = 1e30, max_z = -1e30;
+    bool empty = true;
+
+    for (size_t i = 0; i < num_seeds; i++) {
+        if (!seeds->tree_point_is_active(i)) continue;
+        double* pt = seeds->get_tree_point(i);
+        if(pt[0] < min_x) min_x = pt[0]; if(pt[0] > max_x) max_x = pt[0];
+        if(pt[1] < min_y) min_y = pt[1]; if(pt[1] > max_y) max_y = pt[1];
+        if(pt[2] < min_z) min_z = pt[2]; if(pt[2] > max_z) max_z = pt[2];
+        empty = false;
+    }
+
+    if (empty) return 1.0;
+    double dx = max_x - min_x;
+    double dy = max_y - min_y;
+    double dz = max_z - min_z;
+    return std::sqrt(dx*dx + dy*dy + dz*dz);
+}
+
+// 核心优化函数：直接在 seeds 上进行微调以消除 Sliver
+void optimize_seeds_remove_slivers(MeshingTree* seeds) {
+    std::cout << "\n[Sliver Optimization] Starting Sliver Exudation (Method C)..." << std::endl;
 
     size_t num_seeds = seeds->get_num_tree_points();
-    if (num_seeds == 0) return;
+    if (num_seeds < 4) return;
 
-    const int    MAX_ITER = 10;
-    const double SHRINK   = 0.15;  // 姣忔杩唬鍚戜腑鐐规敹缂?15%
+    // // 1. 确定尺度参数
+    double bbox_diag = calc_bbox_diag_tree(seeds);
+    double far_threshold = bbox_diag * 10.0; // 超过 10 倍模型尺寸视为无穷远/Sliver
+    // double perturb_step = bbox_diag * 3e-4;  // 扰动步长 (非常小，约 1/10000)
+    int max_iters = 20; // 最大迭代次数
 
-    for (int iter = 0; iter < MAX_ITER; iter++)
-    {
-        // 1. 鏋勫缓 Delaunay 涓夎鍓栧垎
+    // std::cout << "  -> BBox Diag: " << bbox_diag << std::endl;
+    // std::cout << "  -> Infinity Threshold: " << far_threshold << std::endl;
+    // std::cout << "  -> Perturbation Step: " << perturb_step << std::endl;
+
+    std::mt19937 rng(42); // 固定种子
+    std::uniform_real_distribution<double> dist(-1.0, 1.0);
+
+    std::vector<std::array<double, 3>> x0(num_seeds, { 0.0, 0.0, 0.0 });
+    for (size_t i = 0; i < num_seeds; i++) {
+        if (!seeds->tree_point_is_active(i)) continue;
+        double* pt = seeds->get_tree_point(i);
+        x0[i] = { pt[0], pt[1], pt[2] };
+    }
+
+    const double alpha = 0.7;
+    const double max_step = bbox_diag * 5e-3;
+    const double sliver_q_threshold = 0.03;
+    const double feature_angle_deg = 40.0;
+    const double feature_cos = std::cos(feature_angle_deg * M_PI / 180.0);
+    const double feature_mobility = 0.15;
+    const double feature_penalty_multiplier = 20.0;
+    const double feature_cell_density_boost = 2.5;
+
+    for (int iter = 0; iter < max_iters; ++iter) {
         Delaunay dt;
         std::vector<Vertex_handle> vhs(num_seeds);
-        std::vector<bool> inserted(num_seeds, false);
+        std::vector<char> inserted(num_seeds, 0);
 
         for (size_t i = 0; i < num_seeds; i++) {
             if (!seeds->tree_point_is_active(i)) continue;
             double* pt = seeds->get_tree_point(i);
-            Point_3 p(pt[0], pt[1], pt[2]);
-            Vertex_handle vh = dt.insert(p);
+            Vertex_handle vh = dt.insert(Point_3(pt[0], pt[1], pt[2]));
             vh->info() = i;
             vhs[i] = vh;
-            inserted[i] = true;
+            inserted[i] = 1;
         }
 
-        // 2. 妫€鏌ユ墍鏈夌瀛愬鐨?Delaunay 閭绘帴鎬?
-        int broken = 0, total = 0;
-        std::vector<std::pair<size_t, size_t>> broken_pairs;
+        std::vector<double> mobility(num_seeds, 1.0);
+        for (auto vit = dt.finite_vertices_begin(); vit != dt.finite_vertices_end(); ++vit) {
+            Vertex_handle vh = vit;
+            const size_t idx = vh->info();
+            if (idx >= num_seeds) continue;
 
-        for (size_t i = 0; i < num_seeds; i++) {
-            if (!inserted[i]) continue;
-            size_t* attr_i = seeds->get_tree_point_attrib(i);
-            size_t j = attr_i[1];
-            if (j >= num_seeds || j <= i) continue;   // 姣忓鍙鐞嗕竴娆?
-            if (!inserted[j]) continue;
-            size_t* attr_j = seeds->get_tree_point_attrib(j);
-            if (attr_j[1] != i) continue;             // 纭浜掔浉閰嶅
-            if (vhs[i] == vhs[j]) continue;           // 閲嶅悎鐐硅烦杩?
+            double* ni = seeds->get_tree_point_normal(idx);
+            double nix = ni[0], niy = ni[1], niz = ni[2];
+            double nil2 = nix * nix + niy * niy + niz * niz;
+            if (nil2 < 1e-20) continue;
+            double inv_nil = 1.0 / std::sqrt(nil2);
+            nix *= inv_nil; niy *= inv_nil; niz *= inv_nil;
 
-            total++;
+            double min_dot = 1.0;
+            std::vector<Vertex_handle> neighbor_vertices;
+            dt.incident_vertices(vh, std::back_inserter(neighbor_vertices));
+            for (Vertex_handle nv : neighbor_vertices) {
+                if (dt.is_infinite(nv)) continue;
+                const size_t j = nv->info();
+                if (j >= num_seeds) continue;
+                double* nj = seeds->get_tree_point_normal(j);
+                double njx = nj[0], njy = nj[1], njz = nj[2];
+                double njl2 = njx * njx + njy * njy + njz * njz;
+                if (njl2 < 1e-20) continue;
+                double inv_njl = 1.0 / std::sqrt(njl2);
+                njx *= inv_njl; njy *= inv_njl; njz *= inv_njl;
+                double d = nix * njx + niy * njy + niz * njz;
+                if (d < min_dot) min_dot = d;
+            }
 
-            Cell_handle c; int ci, cj;
-            if (!dt.is_edge(vhs[i], vhs[j], c, ci, cj)) {
-                broken++;
-                broken_pairs.push_back(std::make_pair(i, j));
+            if (min_dot < feature_cos) {
+                mobility[idx] = feature_mobility;
             }
         }
 
-        std::cout << "  Iter " << (iter + 1) << ": "
-                  << broken << "/" << total << " broken pairs" << std::endl;
+        std::set<size_t> seeds_to_perturb;
+        std::vector<std::array<double, 3>> sliver_cell_centroids;
+        std::vector<double> sum_w(num_seeds, 0.0);
+        std::vector<std::array<double, 3>> sum_wc(num_seeds, { 0.0, 0.0, 0.0 });
+        int bad_cells = 0;
 
-        if (broken == 0) {
-            std::cout << "  All seed pairs are Delaunay-adjacent." << std::endl;
+        auto tri_area = [&](const Point_3& a, const Point_3& b, const Point_3& c) -> double {
+            typedef CGAL::Vector_3<K> Vector_3;
+            Vector_3 ab = b - a;
+            Vector_3 ac = c - a;
+            Vector_3 cr = CGAL::cross_product(ab, ac);
+            double al2 = CGAL::to_double(cr.squared_length());
+            if (al2 < 1e-30) return 0.0;
+            return 0.5 * std::sqrt(al2);
+        };
+
+        for (auto cit = dt.finite_cells_begin(); cit != dt.finite_cells_end(); ++cit) {
+            const Point_3& p0 = cit->vertex(0)->point();
+            const Point_3& p1 = cit->vertex(1)->point();
+            const Point_3& p2 = cit->vertex(2)->point();
+            const Point_3& p3 = cit->vertex(3)->point();
+
+            double vol = std::abs(CGAL::to_double(CGAL::volume(p0, p1, p2, p3)));
+            if (vol < 1e-20) continue;
+
+            Point_3 cc = dt.dual(cit);
+            double ccx = CGAL::to_double(cc.x());
+            double ccy = CGAL::to_double(cc.y());
+            double ccz = CGAL::to_double(cc.z());
+
+            // double area_sum = 0.0;
+            // area_sum += tri_area(p1, p2, p3);
+            // area_sum += tri_area(p0, p2, p3);
+            // area_sum += tri_area(p0, p1, p3);
+            // area_sum += tri_area(p0, p1, p2);
+            // if (area_sum < 1e-20) continue;
+
+            // double in_r = 3.0 * vol / area_sum;
+            // double r2 = CGAL::to_double(CGAL::squared_distance(cc, p0));
+            // double out_r = (r2 < 1e-30) ? 0.0 : std::sqrt(r2);
+            // double q = (out_r > 0.0) ? (in_r / out_r) : 0.0;
+
+            //bool is_bad = (q < sliver_q_threshold) || (std::abs(ccx) > far_threshold || std::abs(ccy) > far_threshold || std::abs(ccz) > far_threshold);
+            bool is_bad = (std::abs(ccx) > far_threshold || std::abs(ccy) > far_threshold || std::abs(ccz) > far_threshold);
+            if (is_bad) {
+                bad_cells++;
+                for (int i = 0; i < 4; ++i) {
+                    seeds_to_perturb.insert(cit->vertex(i)->info());
+                }
+
+                double cx = 0.0, cy = 0.0, cz = 0.0;
+                for (int i = 0; i < 4; ++i) {
+                    const Point_3& p = cit->vertex(i)->point();
+                    cx += CGAL::to_double(p.x());
+                    cy += CGAL::to_double(p.y());
+                    cz += CGAL::to_double(p.z());
+                }
+                const double inv = 1.0 / 4.0;
+                sliver_cell_centroids.push_back({ cx * inv, cy * inv, cz * inv });
+            }
+
+            double w = vol;
+            bool touches_feature = false;
+            for (int i = 0; i < 4; ++i) {
+                const size_t vidx = cit->vertex(i)->info();
+                if (vidx < num_seeds && mobility[vidx] < 1.0) {
+                    touches_feature = true;
+                    break;
+                }
+            }
+            if (touches_feature) w *= feature_cell_density_boost;
+
+            for (int i = 0; i < 4; ++i) {
+                const size_t vidx = cit->vertex(i)->info();
+                if (vidx >= num_seeds) continue;
+                sum_w[vidx] += w;
+                sum_wc[vidx][0] += w * ccx;
+                sum_wc[vidx][1] += w * ccy;
+                sum_wc[vidx][2] += w * ccz;
+            }
+        }
+
+        std::cout << "  -> Iter " << iter << ": Found " << bad_cells << " sliver cells." << std::endl;
+
+        if (bad_cells == 0) {
+            std::cout << "  -> Optimization converged. Mesh is sliver-free." << std::endl;
             break;
         }
 
-        // 3. 鏀剁缉鏂鐨勭瀛愬锛氬皢涓ょ鍚勫悜涓偣绉诲姩 SHRINK 姣斾緥
-        //    涓偣 M = (A+B)/2 浣嶄簬鏇查潰涓婏紝鏀剁缉涓嶆敼鍙?M 鐨勪綅缃?
-        for (size_t bp = 0; bp < broken_pairs.size(); bp++) {
-            size_t si = broken_pairs[bp].first;
-            size_t sj = broken_pairs[bp].second;
-            double* pi = seeds->get_tree_point(si);
-            double* pj = seeds->get_tree_point(sj);
+        for (size_t seed_idx : seeds_to_perturb) {
+            if (seed_idx >= num_seeds) continue;
+            if (!inserted[seed_idx]) continue;
+            if (sum_w[seed_idx] <= 0.0) continue;
 
-            for (int d = 0; d < 3; d++) {
-                double mid = (pi[d] + pj[d]) * 0.5;
-                pi[d] += SHRINK * (mid - pi[d]);
-                pj[d] += SHRINK * (mid - pj[d]);
+            double* pt = seeds->get_tree_point(seed_idx);
+            double curx = pt[0], cury = pt[1], curz = pt[2];
+
+            double tx = sum_wc[seed_idx][0] / sum_w[seed_idx];
+            double ty = sum_wc[seed_idx][1] / sum_w[seed_idx];
+            double tz = sum_wc[seed_idx][2] / sum_w[seed_idx];
+
+            if (mobility[seed_idx] < 1.0) {
+                double lambda = feature_penalty_multiplier * sum_w[seed_idx];
+                tx = (sum_wc[seed_idx][0] + lambda * x0[seed_idx][0]) / (sum_w[seed_idx] + lambda);
+                ty = (sum_wc[seed_idx][1] + lambda * x0[seed_idx][1]) / (sum_w[seed_idx] + lambda);
+                tz = (sum_wc[seed_idx][2] + lambda * x0[seed_idx][2]) / (sum_w[seed_idx] + lambda);
             }
+
+            tx += dist(rng) * (bbox_diag * 1e-12);
+            ty += dist(rng) * (bbox_diag * 1e-12);
+            tz += dist(rng) * (bbox_diag * 1e-12);
+
+            double dx = tx - curx;
+            double dy = ty - cury;
+            double dz = tz - curz;
+
+            double step = alpha * mobility[seed_idx];
+            dx *= step; dy *= step; dz *= step;
+
+            double dl2 = dx * dx + dy * dy + dz * dz;
+            if (dl2 > max_step * max_step) {
+                double s = max_step / std::sqrt(dl2);
+                dx *= s; dy *= s; dz *= s;
+            }
+
+            pt[0] += dx;
+            pt[1] += dy;
+            pt[2] += dz;
         }
     }
-
-    std::cout << "[Generator] Seed pair adjacency repair complete." << std::endl;
+    std::cout << "[Sliver Optimization] Done.\n" << std::endl;
 }
+
 
 void Generator::generate_surface_mesh(MeshingTree* seeds, const char* output_filename)
 {
     std::cout << "Generating surface mesh using CGAL Voronoi..." << std::endl;
+
+    optimize_seeds_remove_slivers(seeds);
     
     size_t num_seeds = seeds->get_num_tree_points();
     if (num_seeds == 0) {
@@ -132,6 +297,69 @@ void Generator::generate_surface_mesh(MeshingTree* seeds, const char* output_fil
     }
     
     std::cout << "  * Delaunay triangulation built with " << dt.number_of_vertices() << " vertices" << std::endl;
+
+    // Export global Voronoi diagram
+    {
+        std::cout << "  * Exporting global Voronoi diagram to global_voronoi.obj..." << std::endl;
+        
+        std::ofstream voronoi_file("global_voronoi.obj");
+        if (!voronoi_file.is_open()) {
+            std::cerr << "Error: Cannot create global_voronoi.obj" << std::endl;
+        } else {
+            voronoi_file << std::fixed << std::setprecision(16);
+            voronoi_file << "# Global Voronoi Diagram\n";
+            voronoi_file << "# Generated from Delaunay triangulation with " << dt.number_of_vertices() << " vertices\n\n";
+            
+            size_t vertex_offset = 1;
+            size_t facet_count = 0;
+            
+            // Export all finite Voronoi facets
+            for (auto eit = dt.finite_edges_begin(); eit != dt.finite_edges_end(); ++eit) {
+                Cell_handle c = eit->first;
+                int i1 = eit->second;
+                int i2 = eit->third;
+                
+                // Get the dual Voronoi facet for this Delaunay edge
+                std::vector<Point_3> facet_vertices;
+                
+                Delaunay::Cell_circulator cc = dt.incident_cells(*eit);
+                Delaunay::Cell_circulator done = cc;
+                
+                if (cc != nullptr) {
+                    do {
+                        if (!dt.is_infinite(cc)) {
+                            Point_3 center = dt.dual(cc);
+                            facet_vertices.push_back(center);
+                        }
+                        ++cc;
+                    } while (cc != done);
+                }
+                
+                // Only export facets with at least 3 vertices
+                if (facet_vertices.size() >= 3) {
+                    // Write vertices
+                    for (const auto& pt : facet_vertices) {
+                        voronoi_file << "v " << CGAL::to_double(pt.x()) << " " 
+                                   << CGAL::to_double(pt.y()) << " " 
+                                   << CGAL::to_double(pt.z()) << "\n";
+                    }
+                    
+                    // Write face as polygon
+                    voronoi_file << "f";
+                    for (size_t i = 0; i < facet_vertices.size(); ++i) {
+                        voronoi_file << " " << (vertex_offset + i);
+                    }
+                    voronoi_file << "\n";
+                    
+                    vertex_offset += facet_vertices.size();
+                    facet_count++;
+                }
+            }
+            
+            voronoi_file.close();
+            std::cout << "  * Global Voronoi diagram exported: " << facet_count << " facets (global_voronoi.obj)" << std::endl;
+        }
+    }
 
 
 

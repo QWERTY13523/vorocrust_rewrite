@@ -21,6 +21,8 @@ file(GLOB VOROCRUST_SOURCES
   "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
 )
 
+list(FILTER VOROCRUST_SOURCES EXCLUDE REGEX "VoronoiMesh1\\.cpp$")
+
 add_executable(vorocrust ${VOROCRUST_SOURCES})
 
 target_include_directories(vorocrust PRIVATE
