@@ -6,6 +6,7 @@
 #include <fstream>
 #include <random>
 #include <iomanip>
+#include <limits>
 #include <set>
 #include <string>
 #include <vector>
@@ -26,257 +27,347 @@ typedef Delaunay::Cell_handle Cell_handle;
 typedef Delaunay::Edge Edge;
 typedef K::Point_3 Point;
 
-// =========================================================
-// ensure_seed_pair_adjacency:
-// =========================================================
+void optimizer(MeshingTree* seeds, MeshingTree* spheres, std::vector<int> face_flat)
+{
+    Geometry geom;
+    size_t num_spheres = spheres->get_num_tree_points();
+    size_t num_faces_total = face_flat.size() / 3;
 
-double calc_bbox_diag_tree(MeshingTree* seeds) {
-    size_t num_seeds = seeds->get_num_tree_points();
-    double min_x = 1e30, max_x = -1e30;
-    double min_y = 1e30, max_y = -1e30;
-    double min_z = 1e30, max_z = -1e30;
-    bool empty = true;
+    std::cout << "=== Optimizer: fixing non-adjacent seed pairs ===" << std::endl;
 
-    for (size_t i = 0; i < num_seeds; i++) {
-        if (!seeds->tree_point_is_active(i)) continue;
-        double* pt = seeds->get_tree_point(i);
-        if(pt[0] < min_x) min_x = pt[0]; if(pt[0] > max_x) max_x = pt[0];
-        if(pt[1] < min_y) min_y = pt[1]; if(pt[1] > max_y) max_y = pt[1];
-        if(pt[2] < min_z) min_z = pt[2]; if(pt[2] > max_z) max_z = pt[2];
-        empty = false;
+    auto pair_key = [](size_t a, size_t b) -> std::pair<size_t, size_t> {
+        return (a < b) ? std::make_pair(a, b) : std::make_pair(b, a);
+    };
+
+    auto make_face_key = [](size_t a, size_t b, size_t c) -> std::tuple<size_t, size_t, size_t> {
+        size_t arr[3] = {a, b, c};
+        if (arr[0] > arr[1]) std::swap(arr[0], arr[1]);
+        if (arr[1] > arr[2]) std::swap(arr[1], arr[2]);
+        if (arr[0] > arr[1]) std::swap(arr[0], arr[1]);
+        return std::make_tuple(arr[0], arr[1], arr[2]);
+    };
+
+    // Build sphere-to-faces map: for each sphere, which face indices contain it
+    std::vector<std::vector<size_t>> sphere_to_faces(num_spheres);
+    for (size_t fi = 0; fi < num_faces_total; fi++) {
+        for (int k = 0; k < 3; k++) {
+            int sid = face_flat[fi * 3 + k];
+            if (sid >= 0 && (size_t)sid < num_spheres)
+                sphere_to_faces[sid].push_back(fi);
+        }
     }
 
-    if (empty) return 1.0;
-    double dx = max_x - min_x;
-    double dy = max_y - min_y;
-    double dz = max_z - min_z;
-    return std::sqrt(dx*dx + dy*dy + dz*dz);
-}
+    // Helper: compute seed pair for a face given 3 sphere indices
+    // Returns true if valid; fills seed_a[4], seed_b[4], normal_out[3]
+    auto compute_face_seeds = [&](size_t si, size_t sj, size_t sk,
+                                   double* seed_a, double* seed_b,
+                                   double* normal_out) -> bool {
+        double sp_i[4], sp_j[4], sp_k[4];
+        spheres->get_tree_point(si, 4, sp_i);
+        spheres->get_tree_point(sj, 4, sp_j);
+        spheres->get_tree_point(sk, 4, sp_k);
 
-// 核心优化函数：直接在 seeds 上进行微调以消除 Sliver
-void optimize_seeds_remove_slivers(MeshingTree* seeds) {
-    std::cout << "\n[Sliver Optimization] Starting Sliver Exudation (Method C)..." << std::endl;
+        // Pairwise overlap check (two spheres intersect iff dist < r1+r2)
+        if (geom.distance(3, sp_i, sp_j) > sp_i[3] + sp_j[3] + 1e-10) return false;
+        if (geom.distance(3, sp_i, sp_k) > sp_i[3] + sp_k[3] + 1e-10) return false;
+        if (geom.distance(3, sp_j, sp_k) > sp_j[3] + sp_k[3] + 1e-10) return false;
 
-    size_t num_seeds = seeds->get_num_tree_points();
-    if (num_seeds < 4) return;
+        // Power vertex (radical center)
+        double* centers[3] = {sp_i, sp_j, sp_k};
+        double radii[3]    = {sp_i[3], sp_j[3], sp_k[3]};
+        double c_ijk[3];
+        if (!geom.get_power_vertex(3, 3, centers, radii, c_ijk)) return false;
 
-    // // 1. 确定尺度参数
-    double bbox_diag = calc_bbox_diag_tree(seeds);
-    double far_threshold = bbox_diag * 10.0; // 超过 10 倍模型尺寸视为无穷远/Sliver
-    // double perturb_step = bbox_diag * 3e-4;  // 扰动步长 (非常小，约 1/10000)
-    int max_iters = 20; // 最大迭代次数
+        double hi = geom.distance(3, c_ijk, sp_i);
+        if (hi > sp_i[3] - 1e-10) return false;
 
-    // std::cout << "  -> BBox Diag: " << bbox_diag << std::endl;
-    // std::cout << "  -> Infinity Threshold: " << far_threshold << std::endl;
-    // std::cout << "  -> Perturbation Step: " << perturb_step << std::endl;
+        double vi = sqrt(fmax(0.0, sp_i[3] * sp_i[3] - hi * hi));
+        if (vi < 1e-5) vi = 1e-5;
 
-    std::mt19937 rng(42); // 固定种子
-    std::uniform_real_distribution<double> dist(-1.0, 1.0);
+        if (geom.get_3d_triangle_area(centers) < 1e-10) return false;
+        geom.get_3d_triangle_normal(centers, normal_out);
 
-    std::vector<std::array<double, 3>> x0(num_seeds, { 0.0, 0.0, 0.0 });
-    for (size_t i = 0; i < num_seeds; i++) {
-        if (!seeds->tree_point_is_active(i)) continue;
-        double* pt = seeds->get_tree_point(i);
-        x0[i] = { pt[0], pt[1], pt[2] };
-    }
+        double min_r = fmin(sp_i[3], fmin(sp_j[3], sp_k[3]));
+        for (int d = 0; d < 3; d++) {
+            seed_a[d] = c_ijk[d] + vi * normal_out[d];
+            seed_b[d] = c_ijk[d] - vi * normal_out[d];
+        }
+        seed_a[3] = min_r;
+        seed_b[3] = min_r;
+        return true;
+    };
 
-    const double alpha = 0.7;
-    const double max_step = bbox_diag * 5e-3;
-    const double sliver_q_threshold = 0.03;
-    const double feature_angle_deg = 40.0;
-    const double feature_cos = std::cos(feature_angle_deg * M_PI / 180.0);
-    const double feature_mobility = 0.15;
-    const double feature_penalty_multiplier = 20.0;
-    const double feature_cell_density_boost = 2.5;
+    // Helper: compute dot product with sphere normals for region determination
+    auto compute_seed_dot = [&](double* seed_pos, size_t si, size_t sj, size_t sk) -> double {
+        double dot_sum = 0.0;
+        int count = 0;
+        size_t sids[3] = {si, sj, sk};
+        for (int i = 0; i < 3; i++) {
+            if (sids[i] >= num_spheres) continue;
+            double center[4];
+            spheres->get_tree_point(sids[i], 4, center);
+            double* normal = spheres->get_tree_point_normal(sids[i]);
+            double nlen_sq = normal[0]*normal[0] + normal[1]*normal[1] + normal[2]*normal[2];
+            if (nlen_sq < 1e-20) continue;
+            dot_sum += (seed_pos[0] - center[0]) * normal[0]
+                     + (seed_pos[1] - center[1]) * normal[1]
+                     + (seed_pos[2] - center[2]) * normal[2];
+            count++;
+        }
+        return (count > 0) ? (dot_sum / count) : 0.0;
+    };
 
-    for (int iter = 0; iter < max_iters; ++iter) {
+    const int max_iterations = 10;
+
+    for (int iter = 0; iter < max_iterations; iter++) {
+
+        size_t num_seeds = seeds->get_num_tree_points();
+
+        // ---- Build Delaunay triangulation ----
         Delaunay dt;
-        std::vector<Vertex_handle> vhs(num_seeds);
-        std::vector<char> inserted(num_seeds, 0);
-
+        std::vector<Vertex_handle> vertex_handles(num_seeds);
         for (size_t i = 0; i < num_seeds; i++) {
             if (!seeds->tree_point_is_active(i)) continue;
             double* pt = seeds->get_tree_point(i);
             Vertex_handle vh = dt.insert(Point_3(pt[0], pt[1], pt[2]));
             vh->info() = i;
-            vhs[i] = vh;
-            inserted[i] = 1;
+            vertex_handles[i] = vh;
         }
 
-        std::vector<double> mobility(num_seeds, 1.0);
-        for (auto vit = dt.finite_vertices_begin(); vit != dt.finite_vertices_end(); ++vit) {
-            Vertex_handle vh = vit;
-            const size_t idx = vh->info();
-            if (idx >= num_seeds) continue;
+        // ---- Collect Delaunay edges ----
+        std::set<std::pair<size_t, size_t>> delaunay_edges;
+        for (auto eit = dt.finite_edges_begin(); eit != dt.finite_edges_end(); ++eit) {
+            Cell_handle c = eit->first;
+            Vertex_handle v1 = c->vertex(eit->second);
+            Vertex_handle v2 = c->vertex(eit->third);
+            if (dt.is_infinite(v1) || dt.is_infinite(v2)) continue;
+            size_t s1 = v1->info();
+            size_t s2 = v2->info();
+            if (s1 >= num_seeds || s2 >= num_seeds || s1 == s2) continue;
+            delaunay_edges.insert(pair_key(s1, s2));
+        }
 
-            double* ni = seeds->get_tree_point_normal(idx);
-            double nix = ni[0], niy = ni[1], niz = ni[2];
-            double nil2 = nix * nix + niy * niy + niz * niz;
-            if (nil2 < 1e-20) continue;
-            double inv_nil = 1.0 / std::sqrt(nil2);
-            nix *= inv_nil; niy *= inv_nil; niz *= inv_nil;
-
-            double min_dot = 1.0;
-            std::vector<Vertex_handle> neighbor_vertices;
-            dt.incident_vertices(vh, std::back_inserter(neighbor_vertices));
-            for (Vertex_handle nv : neighbor_vertices) {
-                if (dt.is_infinite(nv)) continue;
-                const size_t j = nv->info();
-                if (j >= num_seeds) continue;
-                double* nj = seeds->get_tree_point_normal(j);
-                double njx = nj[0], njy = nj[1], njz = nj[2];
-                double njl2 = njx * njx + njy * njy + njz * njz;
-                if (njl2 < 1e-20) continue;
-                double inv_njl = 1.0 / std::sqrt(njl2);
-                njx *= inv_njl; njy *= inv_njl; njz *= inv_njl;
-                double d = nix * njx + niy * njy + niz * njz;
-                if (d < min_dot) min_dot = d;
-            }
-
-            if (min_dot < feature_cos) {
-                mobility[idx] = feature_mobility;
+        // ---- Find seed pairs whose Voronoi cells are NOT adjacent ----
+        std::vector<std::pair<size_t, size_t>> non_adjacent_pairs;
+        for (size_t i = 0; i < num_seeds; i++) {
+            if (!seeds->tree_point_is_active(i)) continue;
+            size_t* attrib = seeds->get_tree_point_attrib(i);
+            size_t j = attrib[1];
+            if (j <= i || j >= num_seeds) continue;
+            if (!seeds->tree_point_is_active(j)) continue;
+            size_t* pair_attrib = seeds->get_tree_point_attrib(j);
+            if (pair_attrib[1] != i) continue;
+            if (delaunay_edges.find(pair_key(i, j)) == delaunay_edges.end()) {
+                non_adjacent_pairs.emplace_back(i, j);
             }
         }
 
-        std::set<size_t> seeds_to_perturb;
-        std::vector<std::array<double, 3>> sliver_cell_centroids;
-        std::vector<double> sum_w(num_seeds, 0.0);
-        std::vector<std::array<double, 3>> sum_wc(num_seeds, { 0.0, 0.0, 0.0 });
-        int bad_cells = 0;
+        std::cout << "  Iter " << iter << ": " << non_adjacent_pairs.size()
+                  << " non-adjacent pairs" << std::endl;
+        if (non_adjacent_pairs.empty()) break;
 
-        auto tri_area = [&](const Point_3& a, const Point_3& b, const Point_3& c) -> double {
-            typedef CGAL::Vector_3<K> Vector_3;
-            Vector_3 ab = b - a;
-            Vector_3 ac = c - a;
-            Vector_3 cr = CGAL::cross_product(ab, ac);
-            double al2 = CGAL::to_double(cr.squared_length());
-            if (al2 < 1e-30) return 0.0;
-            return 0.5 * std::sqrt(al2);
-        };
+        // ---- Build face-key -> seeds map ----
+        std::map<std::tuple<size_t,size_t,size_t>, std::vector<size_t>> face_key_to_seeds;
+        for (size_t i = 0; i < num_seeds; i++) {
+            if (!seeds->tree_point_is_active(i)) continue;
+            size_t* attrib = seeds->get_tree_point_attrib(i);
+            auto key = make_face_key(attrib[2], attrib[3], attrib[4]);
+            face_key_to_seeds[key].push_back(i);
+        }
 
-        for (auto cit = dt.finite_cells_begin(); cit != dt.finite_cells_end(); ++cit) {
-            const Point_3& p0 = cit->vertex(0)->point();
-            const Point_3& p1 = cit->vertex(1)->point();
-            const Point_3& p2 = cit->vertex(2)->point();
-            const Point_3& p3 = cit->vertex(3)->point();
+        std::set<size_t> processed_spheres;
+        size_t fixes_this_iter = 0;
 
-            double vol = std::abs(CGAL::to_double(CGAL::volume(p0, p1, p2, p3)));
-            if (vol < 1e-20) continue;
+        for (size_t pi = 0; pi < non_adjacent_pairs.size(); pi++) {
+            size_t seed_i = non_adjacent_pairs[pi].first;
+            size_t seed_j = non_adjacent_pairs[pi].second;
+            if (!seeds->tree_point_is_active(seed_i) ||
+                !seeds->tree_point_is_active(seed_j)) continue;
 
-            Point_3 cc = dt.dual(cit);
-            double ccx = CGAL::to_double(cc.x());
-            double ccy = CGAL::to_double(cc.y());
-            double ccz = CGAL::to_double(cc.z());
+            size_t* attrib_i = seeds->get_tree_point_attrib(seed_i);
+            size_t sph_ids[3] = {attrib_i[2], attrib_i[3], attrib_i[4]};
 
-            // double area_sum = 0.0;
-            // area_sum += tri_area(p1, p2, p3);
-            // area_sum += tri_area(p0, p2, p3);
-            // area_sum += tri_area(p0, p1, p3);
-            // area_sum += tri_area(p0, p1, p2);
-            // if (area_sum < 1e-20) continue;
-
-            // double in_r = 3.0 * vol / area_sum;
-            // double r2 = CGAL::to_double(CGAL::squared_distance(cc, p0));
-            // double out_r = (r2 < 1e-30) ? 0.0 : std::sqrt(r2);
-            // double q = (out_r > 0.0) ? (in_r / out_r) : 0.0;
-
-            //bool is_bad = (q < sliver_q_threshold) || (std::abs(ccx) > far_threshold || std::abs(ccy) > far_threshold || std::abs(ccz) > far_threshold);
-            bool is_bad = (std::abs(ccx) > far_threshold || std::abs(ccy) > far_threshold || std::abs(ccz) > far_threshold);
-            if (is_bad) {
-                bad_cells++;
-                for (int i = 0; i < 4; ++i) {
-                    seeds_to_perturb.insert(cit->vertex(i)->info());
-                }
-
-                double cx = 0.0, cy = 0.0, cz = 0.0;
-                for (int i = 0; i < 4; ++i) {
-                    const Point_3& p = cit->vertex(i)->point();
-                    cx += CGAL::to_double(p.x());
-                    cy += CGAL::to_double(p.y());
-                    cz += CGAL::to_double(p.z());
-                }
-                const double inv = 1.0 / 4.0;
-                sliver_cell_centroids.push_back({ cx * inv, cy * inv, cz * inv });
+            // ---- Choose sphere with fewest faces (least impact) ----
+            int    best_k   = -1;
+            size_t best_sid = SIZE_MAX;
+            size_t min_fc   = SIZE_MAX;
+            for (int k = 0; k < 3; k++) {
+                size_t sid = sph_ids[k];
+                if (sid >= num_spheres) continue;
+                if (processed_spheres.count(sid)) continue;
+                size_t fc = sphere_to_faces[sid].size();
+                if (fc < min_fc) { min_fc = fc; best_k = k; best_sid = sid; }
             }
+            if (best_k < 0) continue;
+            processed_spheres.insert(best_sid);
 
-            double w = vol;
-            bool touches_feature = false;
-            for (int i = 0; i < 4; ++i) {
-                const size_t vidx = cit->vertex(i)->info();
-                if (vidx < num_seeds && mobility[vidx] < 1.0) {
-                    touches_feature = true;
-                    break;
+            double* sph_data = spheres->get_tree_point(best_sid);
+            double  orig_r   = sph_data[3];
+
+            // ---- Compute minimum viable radius ----
+            // For every face containing this sphere, the sphere must still
+            // overlap with the other two spheres (dist < r_new + r_other).
+            // => r_new > dist - r_other   (plus small margin)
+            double r_min = 0.0;
+            for (size_t fi : sphere_to_faces[best_sid]) {
+                for (int k = 0; k < 3; k++) {
+                    size_t other = (size_t)face_flat[fi * 3 + k];
+                    if (other == best_sid) continue;
+                    double other_sp[4];
+                    spheres->get_tree_point(other, 4, other_sp);
+                    double d   = geom.distance(3, sph_data, other_sp);
+                    double req = d - other_sp[3] + 1e-6;
+                    if (req > r_min) r_min = req;
                 }
             }
-            if (touches_feature) w *= feature_cell_density_boost;
+            if (r_min <= 0.0) r_min = 1e-6;
+            if (r_min >= orig_r - 1e-10) continue;  // cannot shrink
 
-            for (int i = 0; i < 4; ++i) {
-                const size_t vidx = cit->vertex(i)->info();
-                if (vidx >= num_seeds) continue;
-                sum_w[vidx] += w;
-                sum_wc[vidx][0] += w * ccx;
-                sum_wc[vidx][1] += w * ccy;
-                sum_wc[vidx][2] += w * ccz;
-            }
-        }
-
-        std::cout << "  -> Iter " << iter << ": Found " << bad_cells << " sliver cells." << std::endl;
-
-        if (bad_cells == 0) {
-            std::cout << "  -> Optimization converged. Mesh is sliver-free." << std::endl;
-            break;
-        }
-
-        for (size_t seed_idx : seeds_to_perturb) {
-            if (seed_idx >= num_seeds) continue;
-            if (!inserted[seed_idx]) continue;
-            if (sum_w[seed_idx] <= 0.0) continue;
-
-            double* pt = seeds->get_tree_point(seed_idx);
-            double curx = pt[0], cury = pt[1], curz = pt[2];
-
-            double tx = sum_wc[seed_idx][0] / sum_w[seed_idx];
-            double ty = sum_wc[seed_idx][1] / sum_w[seed_idx];
-            double tz = sum_wc[seed_idx][2] / sum_w[seed_idx];
-
-            if (mobility[seed_idx] < 1.0) {
-                double lambda = feature_penalty_multiplier * sum_w[seed_idx];
-                tx = (sum_wc[seed_idx][0] + lambda * x0[seed_idx][0]) / (sum_w[seed_idx] + lambda);
-                ty = (sum_wc[seed_idx][1] + lambda * x0[seed_idx][1]) / (sum_w[seed_idx] + lambda);
-                tz = (sum_wc[seed_idx][2] + lambda * x0[seed_idx][2]) / (sum_w[seed_idx] + lambda);
+            // ---- Collect old seeds from all affected faces ----
+            std::set<std::tuple<size_t,size_t,size_t>> affected_keys;
+            for (size_t fi : sphere_to_faces[best_sid]) {
+                affected_keys.insert(make_face_key(
+                    (size_t)face_flat[fi*3],
+                    (size_t)face_flat[fi*3+1],
+                    (size_t)face_flat[fi*3+2]));
             }
 
-            tx += dist(rng) * (bbox_diag * 1e-12);
-            ty += dist(rng) * (bbox_diag * 1e-12);
-            tz += dist(rng) * (bbox_diag * 1e-12);
-
-            double dx = tx - curx;
-            double dy = ty - cury;
-            double dz = tz - curz;
-
-            double step = alpha * mobility[seed_idx];
-            dx *= step; dy *= step; dz *= step;
-
-            double dl2 = dx * dx + dy * dy + dz * dz;
-            if (dl2 > max_step * max_step) {
-                double s = max_step / std::sqrt(dl2);
-                dx *= s; dy *= s; dz *= s;
+            std::vector<size_t> seeds_to_delete;
+            for (auto& fk : affected_keys) {
+                auto it = face_key_to_seeds.find(fk);
+                if (it == face_key_to_seeds.end()) continue;
+                for (size_t s : it->second) {
+                    if (seeds->tree_point_is_active(s))
+                        seeds_to_delete.push_back(s);
+                }
             }
 
-            pt[0] += dx;
-            pt[1] += dy;
-            pt[2] += dz;
+            // ---- Binary search for smallest valid radius ----
+            // Constraints checked:
+            //   C1. Every affected face still produces valid seeds
+            //       (pairwise overlap, power vertex inside all 3 spheres).
+            //   C2. New seed positions > 1e-3 from all non-deleted active seeds.
+            double lo   = r_min;
+            double hi_r = orig_r;
+            double valid_r = orig_r;
+            bool   found   = false;
+
+            for (int bs = 0; bs < 40; bs++) {
+                double mid = (lo + hi_r) / 2.0;
+                sph_data[3] = mid;
+
+                bool all_ok = true;
+
+                // -- C1: face validity --
+                for (size_t fi : sphere_to_faces[best_sid]) {
+                    double sa[4], sb[4], nm[3];
+                    if (!compute_face_seeds(
+                            (size_t)face_flat[fi*3],
+                            (size_t)face_flat[fi*3+1],
+                            (size_t)face_flat[fi*3+2],
+                            sa, sb, nm)) {
+                        all_ok = false;
+                        break;
+                    }
+                }
+
+                // -- C2: distance check --
+                if (all_ok) {
+                    for (size_t fi : sphere_to_faces[best_sid]) {
+                        double sa[4], sb[4], nm[3];
+                        compute_face_seeds(
+                            (size_t)face_flat[fi*3],
+                            (size_t)face_flat[fi*3+1],
+                            (size_t)face_flat[fi*3+2],
+                            sa, sb, nm);
+
+                        // Constraint: distance between new seed pair > 1e-4
+                        if (geom.distance(3, sa, sb) <= 1e-4) { all_ok = false; break; }
+
+                        size_t ic; double hc = DBL_MAX;
+                        seeds->get_closest_tree_point(
+                            sa, seeds_to_delete.size(),
+                            seeds_to_delete.data(), ic, hc);
+                        if (hc < 1e-3) { all_ok = false; break; }
+
+                        hc = DBL_MAX;
+                        seeds->get_closest_tree_point(
+                            sb, seeds_to_delete.size(),
+                            seeds_to_delete.data(), ic, hc);
+                        if (hc < 1e-3) { all_ok = false; break; }
+                    }
+                }
+
+                if (all_ok) {
+                    valid_r = mid;
+                    found   = true;
+                    hi_r    = mid;   // try even smaller
+                } else {
+                    lo = mid;        // too small, increase
+                }
+            }
+
+            sph_data[3] = orig_r;  // restore temporarily
+            if (!found) continue;
+
+            // ---- Apply the shrink ----
+            sph_data[3] = valid_r;
+            std::cout << "    Sphere " << best_sid
+                      << ": radius " << orig_r << " -> " << valid_r << std::endl;
+
+            // ---- Delete old seeds from affected faces ----
+            for (size_t s : seeds_to_delete) {
+                seeds->lazy_delete_tree_point(s);
+            }
+
+            // ---- Recompute and add new seeds for each affected face ----
+            for (size_t fi : sphere_to_faces[best_sid]) {
+                size_t s0 = (size_t)face_flat[fi*3];
+                size_t s1 = (size_t)face_flat[fi*3+1];
+                size_t s2 = (size_t)face_flat[fi*3+2];
+
+                double seed_a[4], seed_b[4], normal[3];
+                if (!compute_face_seeds(s0, s1, s2, seed_a, seed_b, normal))
+                    continue;
+
+                // Determine inside/outside region for each seed using dot product comparison
+                // Larger dot product -> Outside (0)
+                // Smaller dot product -> Inside (1)
+                double dot_a = compute_seed_dot(seed_a, s0, s1, s2);
+                double dot_b = compute_seed_dot(seed_b, s0, s1, s2);
+
+                size_t region_a = (dot_a >= dot_b) ? 0 : 1;
+                size_t region_b = (dot_a >= dot_b) ? 1 : 0;
+
+                size_t idx_a = seeds->get_num_tree_points();
+                size_t idx_b = idx_a + 1;
+
+                // attrib layout: [0]=count, [1]=pair, [2..4]=spheres, [5]=region
+                size_t att_a[6] = {6, idx_b, s0, s1, s2, region_a};
+                size_t att_b[6] = {6, idx_a, s0, s1, s2, region_b};
+
+                // normal stored with num_dim=4 elements
+                double normal_a[4] = { normal[0],  normal[1],  normal[2], 0.0};
+                double normal_b[4] = {-normal[0], -normal[1], -normal[2], 0.0};
+
+                seeds->add_tree_point(4, seed_a, normal_a, att_a);
+                seeds->add_tree_point(4, seed_b, normal_b, att_b);
+            }
+
+            fixes_this_iter++;
         }
+
+        std::cout << "  Applied " << fixes_this_iter << " sphere shrinks" << std::endl;
+        if (fixes_this_iter == 0) break;
     }
-    std::cout << "[Sliver Optimization] Done.\n" << std::endl;
+
+    std::cout << "=== Optimizer finished ===" << std::endl;
 }
 
-
-void Generator::generate_surface_mesh(MeshingTree* seeds, const char* output_filename)
+void Generator::generate_surface_mesh(MeshingTree* seeds, MeshingTree* spheres, const char* output_filename)
 {
     std::cout << "Generating surface mesh using CGAL Voronoi..." << std::endl;
 
-    optimize_seeds_remove_slivers(seeds);
     
     size_t num_seeds = seeds->get_num_tree_points();
     if (num_seeds == 0) {
@@ -287,79 +378,213 @@ void Generator::generate_surface_mesh(MeshingTree* seeds, const char* output_fil
     // 1. Build Delaunay triangulation with seed index info
     Delaunay dt;
     std::vector<Vertex_handle> vertex_handles(num_seeds);
-    
-    for (size_t i = 0; i < num_seeds; i++) {
-        if (!seeds->tree_point_is_active(i)) continue;
-        double* pt = seeds->get_tree_point(i);
-        Vertex_handle vh = dt.insert(Point_3(pt[0], pt[1], pt[2]));
-        vh->info() = i;
-        vertex_handles[i] = vh;
-    }
-    
+
+    auto pair_key = [](size_t a, size_t b) {
+        return (a < b) ? std::make_pair(a, b) : std::make_pair(b, a);
+    };
+
+    auto build_delaunay = [&]() {
+        dt.clear();
+        std::fill(vertex_handles.begin(), vertex_handles.end(), Vertex_handle());
+        for (size_t i = 0; i < num_seeds; i++) {
+            if (!seeds->tree_point_is_active(i)) continue;
+            double* pt = seeds->get_tree_point(i);
+            Vertex_handle vh = dt.insert(Point_3(pt[0], pt[1], pt[2]));
+            vh->info() = i;
+            vertex_handles[i] = vh;
+        }
+    };
+
+    // auto calc_bbox_diag = [&]() {
+    //     double min_x = std::numeric_limits<double>::max();
+    //     double min_y = std::numeric_limits<double>::max();
+    //     double min_z = std::numeric_limits<double>::max();
+    //     double max_x = -std::numeric_limits<double>::max();
+    //     double max_y = -std::numeric_limits<double>::max();
+    //     double max_z = -std::numeric_limits<double>::max();
+    //     bool has_active_seed = false;
+
+    //     for (size_t i = 0; i < num_seeds; i++) {
+    //         if (!seeds->tree_point_is_active(i)) continue;
+    //         double* pt = seeds->get_tree_point(i);
+    //         min_x = std::min(min_x, pt[0]);
+    //         min_y = std::min(min_y, pt[1]);
+    //         min_z = std::min(min_z, pt[2]);
+    //         max_x = std::max(max_x, pt[0]);
+    //         max_y = std::max(max_y, pt[1]);
+    //         max_z = std::max(max_z, pt[2]);
+    //         has_active_seed = true;
+    //     }
+
+    //     if (!has_active_seed) return 1.0;
+    //     double dx = max_x - min_x;
+    //     double dy = max_y - min_y;
+    //     double dz = max_z - min_z;
+    //     return std::sqrt(dx * dx + dy * dy + dz * dz);
+    // };
+
+    // // Enforce adjacency for paired seeds by shrinking non-adjacent pair distance iteratively.
+    // const int max_pair_adjust_iters = 20;
+    // const double bbox_diag = calc_bbox_diag();
+    // const double move_step_start = std::max(6e-4, bbox_diag * 6e-4);
+    // const double move_step_end = std::max(2e-4, bbox_diag * 2e-4);
+    // size_t last_non_adjacent_count = 0;
+
+    // for (int iter = 0; iter < max_pair_adjust_iters; ++iter) {
+    //     build_delaunay();
+
+    //     // Learning-rate style schedule: larger step early, smaller step later.
+    //     double t = (max_pair_adjust_iters > 1)
+    //         ? static_cast<double>(iter) / static_cast<double>(max_pair_adjust_iters - 1)
+    //         : 1.0;
+    //     double move_step = move_step_start + (move_step_end - move_step_start) * t;
+
+    //     std::set<std::pair<size_t, size_t>> delaunay_edges;
+    //     for (auto eit = dt.finite_edges_begin(); eit != dt.finite_edges_end(); ++eit) {
+    //         Cell_handle c = eit->first;
+    //         int i1 = eit->second;
+    //         int i2 = eit->third;
+    //         Vertex_handle v1 = c->vertex(i1);
+    //         Vertex_handle v2 = c->vertex(i2);
+    //         if (dt.is_infinite(v1) || dt.is_infinite(v2)) continue;
+
+    //         size_t s1 = v1->info();
+    //         size_t s2 = v2->info();
+    //         if (s1 >= num_seeds || s2 >= num_seeds || s1 == s2) continue;
+    //         delaunay_edges.insert(pair_key(s1, s2));
+    //     }
+
+    //     std::vector<std::pair<size_t, size_t>> non_adjacent_pairs;
+    //     for (size_t i = 0; i < num_seeds; i++) {
+    //         if (!seeds->tree_point_is_active(i)) continue;
+    //         size_t* attrib = seeds->get_tree_point_attrib(i);
+    //         size_t j = attrib[1];
+    //         if (j <= i || j >= num_seeds) continue;
+    //         if (!seeds->tree_point_is_active(j)) continue;
+    //         size_t* pair_attrib = seeds->get_tree_point_attrib(j);
+    //         if (pair_attrib[1] != i) continue;
+
+    //         if (delaunay_edges.find(pair_key(i, j)) == delaunay_edges.end()) {
+    //             non_adjacent_pairs.emplace_back(i, j);
+    //         }
+    //     }
+
+    //     std::cout << "iter : " << iter << " " << last_non_adjacent_count << "\n";
+    //     last_non_adjacent_count = non_adjacent_pairs.size();
+    //     if (last_non_adjacent_count == 0) {
+    //         if (iter > 0) {
+    //             std::cout << "  * Seed-pair adjacency converged after " << iter
+    //                       << " iterations" << std::endl;
+    //         }
+    //         break;
+    //     }
+
+    //     for (const auto& pr : non_adjacent_pairs) {
+    //         double* p1 = seeds->get_tree_point(pr.first);
+    //         double* p2 = seeds->get_tree_point(pr.second);
+
+    //         double dx = p2[0] - p1[0];
+    //         double dy = p2[1] - p1[1];
+    //         double dz = p2[2] - p1[2];
+    //         double dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+    //         if (dist < 1e-12) continue;
+
+    //         double move_len = std::min(move_step, 0.45 * dist);
+    //         if (move_len <= 0.0) continue;
+
+    //         double inv_dist = 1.0 / dist;
+    //         p1[0] += dx * inv_dist * move_len;
+    //         p1[1] += dy * inv_dist * move_len;
+    //         p1[2] += dz * inv_dist * move_len;
+    //         p2[0] -= dx * inv_dist * move_len;
+    //         p2[1] -= dy * inv_dist * move_len;
+    //         p2[2] -= dz * inv_dist * move_len;
+    //     }
+    // }
+
+    // Rebuild once to ensure dt/vertex_handles match final adjusted seed positions.
+    build_delaunay();
+    // if (last_non_adjacent_count > 0) {
+    //     std::cout << "  * Warning: still " << last_non_adjacent_count
+    //               << " non-adjacent seed pairs after max iterations" << std::endl;
+    // }
+
     std::cout << "  * Delaunay triangulation built with " << dt.number_of_vertices() << " vertices" << std::endl;
 
-    // Export global Voronoi diagram
-    {
-        std::cout << "  * Exporting global Voronoi diagram to global_voronoi.obj..." << std::endl;
+    // // Export global Voronoi diagram
+    // {
+    //     std::cout << "  * Exporting global Voronoi diagram to global_voronoi.obj..." << std::endl;
         
-        std::ofstream voronoi_file("global_voronoi.obj");
-        if (!voronoi_file.is_open()) {
-            std::cerr << "Error: Cannot create global_voronoi.obj" << std::endl;
-        } else {
-            voronoi_file << std::fixed << std::setprecision(16);
-            voronoi_file << "# Global Voronoi Diagram\n";
-            voronoi_file << "# Generated from Delaunay triangulation with " << dt.number_of_vertices() << " vertices\n\n";
+    //     std::ofstream voronoi_file("global_voronoi.obj");
+    //     if (!voronoi_file.is_open()) {
+    //         std::cerr << "Error: Cannot create global_voronoi.obj" << std::endl;
+    //     } else {
+    //         voronoi_file << std::fixed << std::setprecision(16);
+    //         voronoi_file << "# Global Voronoi Diagram\n";
+    //         voronoi_file << "# Generated from Delaunay triangulation with " << dt.number_of_vertices() << " vertices\n\n";
             
-            size_t vertex_offset = 1;
-            size_t facet_count = 0;
+    //         size_t vertex_offset = 1;
+    //         size_t facet_count = 0;
             
-            // Export all finite Voronoi facets
-            for (auto eit = dt.finite_edges_begin(); eit != dt.finite_edges_end(); ++eit) {
-                Cell_handle c = eit->first;
-                int i1 = eit->second;
-                int i2 = eit->third;
+    //         // Export all finite Voronoi facets
+    //         for (auto eit = dt.finite_edges_begin(); eit != dt.finite_edges_end(); ++eit) {
+    //             Cell_handle c = eit->first;
+    //             int i1 = eit->second;
+    //             int i2 = eit->third;
                 
-                // Get the dual Voronoi facet for this Delaunay edge
-                std::vector<Point_3> facet_vertices;
+    //             // Get the dual Voronoi facet for this Delaunay edge
+    //             std::vector<Point_3> facet_vertices;
                 
-                Delaunay::Cell_circulator cc = dt.incident_cells(*eit);
-                Delaunay::Cell_circulator done = cc;
+    //             Delaunay::Cell_circulator cc = dt.incident_cells(*eit);
+    //             Delaunay::Cell_circulator done = cc;
                 
-                if (cc != nullptr) {
-                    do {
-                        if (!dt.is_infinite(cc)) {
-                            Point_3 center = dt.dual(cc);
-                            facet_vertices.push_back(center);
-                        }
-                        ++cc;
-                    } while (cc != done);
-                }
+    //             if (cc != nullptr) {
+    //                 do {
+    //                     if (!dt.is_infinite(cc)) {
+    //                         Point_3 center = dt.dual(cc);
+    //                         facet_vertices.push_back(center);
+    //                     }
+    //                     ++cc;
+    //                 } while (cc != done);
+    //             }
                 
-                // Only export facets with at least 3 vertices
-                if (facet_vertices.size() >= 3) {
-                    // Write vertices
-                    for (const auto& pt : facet_vertices) {
-                        voronoi_file << "v " << CGAL::to_double(pt.x()) << " " 
-                                   << CGAL::to_double(pt.y()) << " " 
-                                   << CGAL::to_double(pt.z()) << "\n";
-                    }
+    //             // Only export facets with at least 3 vertices and all coords within [-100, 100]
+    //             if (facet_vertices.size() >= 3) {
+    //                 bool all_in_range = true;
+    //                 for (const auto& pt : facet_vertices) {
+    //                     double px = CGAL::to_double(pt.x());
+    //                     double py = CGAL::to_double(pt.y());
+    //                     double pz = CGAL::to_double(pt.z());
+    //                     if (fabs(px) > 100.0 || fabs(py) > 100.0 || fabs(pz) > 100.0) {
+    //                         all_in_range = false;
+    //                         break;
+    //                     }
+    //                 }
+    //                 if (!all_in_range) continue;
+
+    //                 // Write vertices
+    //                 for (const auto& pt : facet_vertices) {
+    //                     voronoi_file << "v " << CGAL::to_double(pt.x()) << " " 
+    //                                << CGAL::to_double(pt.y()) << " " 
+    //                                << CGAL::to_double(pt.z()) << "\n";
+    //                 }
                     
-                    // Write face as polygon
-                    voronoi_file << "f";
-                    for (size_t i = 0; i < facet_vertices.size(); ++i) {
-                        voronoi_file << " " << (vertex_offset + i);
-                    }
-                    voronoi_file << "\n";
+    //                 // Write face as polygon
+    //                 voronoi_file << "f";
+    //                 for (size_t i = 0; i < facet_vertices.size(); ++i) {
+    //                     voronoi_file << " " << (vertex_offset + i);
+    //                 }
+    //                 voronoi_file << "\n";
                     
-                    vertex_offset += facet_vertices.size();
-                    facet_count++;
-                }
-            }
+    //                 vertex_offset += facet_vertices.size();
+    //                 facet_count++;
+    //             }
+    //         }
             
-            voronoi_file.close();
-            std::cout << "  * Global Voronoi diagram exported: " << facet_count << " facets (global_voronoi.obj)" << std::endl;
-        }
-    }
+    //         voronoi_file.close();
+    //         std::cout << "  * Global Voronoi diagram exported: " << facet_count << " facets (global_voronoi.obj)" << std::endl;
+    //     }
+    // }
 
 
 
@@ -377,11 +602,36 @@ void Generator::generate_surface_mesh(MeshingTree* seeds, const char* output_fil
             inside_seeds << std::fixed << std::setprecision(16);
             outside_seeds << std::fixed << std::setprecision(16);
 
-            inside_seeds << "# Inside Seed Points\n";
-            outside_seeds << "# Outside Seed Points\n";
+            inside_seeds << "# Inside Seed Points (seed + sphere centers + links)\n";
+            outside_seeds << "# Outside Seed Points (seed + sphere centers + links)\n";
 
             size_t inside_count = 0;
             size_t outside_count = 0;
+            size_t inside_vertex_offset = 1;
+            size_t outside_vertex_offset = 1;
+            size_t num_spheres = spheres ? static_cast<size_t>(spheres->get_num_tree_points()) : 0;
+
+            auto write_seed_with_spheres = [&](std::ofstream& out,
+                                               size_t& vertex_offset,
+                                               double* seed_pt,
+                                               size_t* attrib) {
+                size_t seed_vertex_index = vertex_offset;
+                out << "v " << seed_pt[0] << " " << seed_pt[1] << " " << seed_pt[2] << "\n";
+                vertex_offset++;
+
+                if (!spheres) return;
+
+                size_t sphere_ids[3] = { attrib[2], attrib[3], attrib[4] };
+                for (size_t si : sphere_ids) {
+                    if (si >= num_spheres) continue;
+                    double sphere_pt[4];
+                    spheres->get_tree_point(si, 4, sphere_pt);
+                    size_t sphere_vertex_index = vertex_offset;
+                    out << "v " << sphere_pt[0] << " " << sphere_pt[1] << " " << sphere_pt[2] << "\n";
+                    out << "l " << seed_vertex_index << " " << sphere_vertex_index << "\n";
+                    vertex_offset++;
+                }
+            };
 
             for (size_t i = 0; i < num_seeds; i++) {
                 if (!seeds->tree_point_is_active(i)) continue;
@@ -393,12 +643,12 @@ void Generator::generate_surface_mesh(MeshingTree* seeds, const char* output_fil
                 // attrib[5] 鏄尯鍩烮D: 0 = 澶栭儴, 闈? = 鍐呴儴
                 if (attrib[5] == 1) {
                     // 澶栭儴绉嶅瓙鐐?
-                    outside_seeds << "v " << pt[0] << " " << pt[1] << " " << pt[2] << "\n";
+                    write_seed_with_spheres(outside_seeds, outside_vertex_offset, pt, attrib);
                     outside_count++;
                 }
                 else {
                     // 鍐呴儴绉嶅瓙鐐?
-                    inside_seeds << "v " << pt[0] << " " << pt[1] << " " << pt[2] << "\n";
+                    write_seed_with_spheres(inside_seeds, inside_vertex_offset, pt, attrib);
                     inside_count++;
                 }
             }
@@ -474,7 +724,7 @@ void Generator::generate_surface_mesh(MeshingTree* seeds, const char* output_fil
         
         // attrib[1] is the pair seed index
         // 杩欓噷浣跨敤涔嬪墠鐢熸垚鐨勯厤瀵逛俊鎭紝鎴栬€呭彲浠ユ敼鐢ㄥ尯鍩?ID (attrib[5]) 鍒ゆ柇: 
-        //  bool is_interface = (attrib1[5] != attrib2[5]);
+        //bool is_interface = (attrib1[5] != attrib2[5]);
         bool is_interface = (attrib1[5] != attrib2[5]) && attrib1[1] == seed_idx2 && attrib2[1] == seed_idx1;
         if (!is_interface) continue;
       //  if (!is_pair) continue;
@@ -674,43 +924,70 @@ void Generator::generate_surface_mesh(MeshingTree* seeds, const char* output_fil
         auto write_voronoi_facets_to_obj_dedup = [&](
             const std::string& filename,
             const std::vector<std::vector<Point_3>>& voronoi_facets,
-            double epsilon = 1e-1,
-            double angle_threshold_deg = 170.0,
+            double epsilon = 5e-2,
+            double angle_threshold_deg = 172.0,
             bool debug = false
         ) {
             std::cout << "  * Starting optimized deduplication export to " << filename << "..." << std::endl;
+            // 优化 IO：使用 buffer 稍微大一点，虽然 ofstream 默认有 buffer
             std::ofstream out(filename);
             if (!out) {
                 std::cerr << "Cannot open file " << filename << std::endl;
                 return;
             }
             out << "# Voronoi facets (epsilon=" << epsilon
-                << ", angle_threshold=" << angle_threshold_deg << "掳)\n";
+                << ", angle_threshold=" << angle_threshold_deg << "deg)\n";
 
             std::vector<Point_3> vertices;
-            std::vector<std::vector<int>> faces;
+            // 预分配内存，避免频繁 realloc。假设平均每个面由 4 个顶点组成
+            vertices.reserve(voronoi_facets.size() * 2); 
             
-            // --- 浼樺寲寮€濮嬶細浣跨敤 map 鍔犻€熸煡鎵?---
-            // 浣跨敤 tuple<long, long, long> 浣滀负 key锛岄€氳繃 epsilon 缂╂斁灏嗗潗鏍囩鏁ｅ寲
-            using VertexKey = std::tuple<long long, long long, long long>;
-            std::map<VertexKey, int> vertex_map; 
+            std::vector<std::vector<int>> faces;
+            faces.reserve(voronoi_facets.size());
+            
+            // --- 优化 1：使用 unordered_map 替代 map (O(logN) -> O(1)) ---
+            // 定义 Key 结构体以避免 std::tuple 的开销
+            struct VertexKey {
+                long long x, y, z;
+                
+                // 重载 == 操作符
+                bool operator==(const VertexKey& other) const {
+                    return x == other.x && y == other.y && z == other.z;
+                }
+            };
+
+            // 自定义 Hash 函数
+            struct VertexKeyHash {
+                std::size_t operator()(const VertexKey& k) const {
+                    // 使用简单的位运算混合 hash，比 boost::hash_combine 快且无依赖
+                    size_t h1 = std::hash<long long>{}(k.x);
+                    size_t h2 = std::hash<long long>{}(k.y);
+                    size_t h3 = std::hash<long long>{}(k.z);
+                    return h1 ^ (h2 << 1) ^ (h3 << 2); // 简单混合
+                }
+            };
+
+            // 使用 unordered_map
+            std::unordered_map<VertexKey, int, VertexKeyHash> vertex_map;
+            // 预分配 map 空间以减少 rehash
+            vertex_map.reserve(voronoi_facets.size() * 3);
+
             double scale_factor = 1.0 / (epsilon > 0 ? epsilon : 1e-6);
 
             int total_input_facets = 0;
             int total_output_facets = 0;
 
-            // 浼樺寲鍚庣殑鏌ユ壘鍑芥暟锛歄(log N)
             auto find_or_add_vertex = [&](const Point_3& p) -> int {
                 double x = CGAL::to_double(p.x());
                 double y = CGAL::to_double(p.y());
                 double z = CGAL::to_double(p.z());
                 
-                // 鍧愭爣绂绘暎鍖?
+                // 坐标离散化逻辑保持不变
                 long long ix = std::llround(x * scale_factor);
                 long long iy = std::llround(y * scale_factor);
                 long long iz = std::llround(z * scale_factor);
                 
-                VertexKey key = std::make_tuple(ix, iy, iz);
+                VertexKey key{ix, iy, iz};
                 
                 auto it = vertex_map.find(key);
                 if (it != vertex_map.end()) {
@@ -718,83 +995,131 @@ void Generator::generate_surface_mesh(MeshingTree* seeds, const char* output_fil
                 }
                 
                 vertices.push_back(p);
-                int idx = static_cast<int>(vertices.size());
-                vertex_map[key] = idx;
+                // vertices.size() 返回的是 size_t，转换为 int
+                int idx = static_cast<int>(vertices.size()); 
+                vertex_map[key] = idx; // OBJ 索引通常从 1 开始，这里存的是内部索引，写入时可能要注意
                 return idx;
             };
-            // --- 浼樺寲缁撴潫 ---
 
+            // 角度计算逻辑保持不变，但为了性能，内联并减少对象创建
             auto compute_angle = [&](const Point_3& p1, const Point_3& p2, const Point_3& p3) -> double {
-                typedef CGAL::Vector_3<K> Vector_3;
-                Vector_3 v1 = p1 - p2;
-                Vector_3 v2 = p3 - p2;
+                // p1 -> prev, p2 -> curr, p3 -> next
+                // Vector_3 构造可能涉及精确运算，这里直接转 double 计算以加速 (逻辑保持一致)
+                double v1x = CGAL::to_double(p1.x() - p2.x());
+                double v1y = CGAL::to_double(p1.y() - p2.y());
+                double v1z = CGAL::to_double(p1.z() - p2.z());
 
-                double len1_sq = CGAL::to_double(v1.squared_length());
-                double len2_sq = CGAL::to_double(v2.squared_length());
+                double v2x = CGAL::to_double(p3.x() - p2.x());
+                double v2y = CGAL::to_double(p3.y() - p2.y());
+                double v2z = CGAL::to_double(p3.z() - p2.z());
+
+                double len1_sq = v1x*v1x + v1y*v1y + v1z*v1z;
+                double len2_sq = v2x*v2x + v2y*v2y + v2z*v2z;
+
                 if (len1_sq < 1e-20 || len2_sq < 1e-20) return 0.0;
 
-                double dot = CGAL::to_double(v1 * v2);
+                double dot = v1x*v2x + v1y*v2y + v1z*v2z;
                 double cos_angle = dot / std::sqrt(len1_sq * len2_sq);
-                cos_angle = std::max(-1.0, std::min(1.0, cos_angle));
+                
+                // Clamp
+                if (cos_angle > 1.0) cos_angle = 1.0;
+                else if (cos_angle < -1.0) cos_angle = -1.0;
 
                 return std::acos(cos_angle) * 180.0 / M_PI;
             };
 
-            auto extract_corner_vertices = [&](const std::vector<Point_3>& polygon) -> std::vector<Point_3> {
-                if (polygon.size() <= 3) return polygon;
-                std::vector<Point_3> corners;
-                std::vector<bool> is_corner(polygon.size(), false);
-                int n = static_cast<int>(polygon.size());
+            // --- 优化 2：减少循环内的内存分配 ---
+            // 将临时容器提到循环外
+            std::vector<Point_3> corner_points;
+            corner_points.reserve(16); // 预估多边形顶点数
+            std::vector<int> face_indices;
+            face_indices.reserve(16);
+            std::vector<int> cleaned_face;
+            cleaned_face.reserve(16);
 
-                for (int i = 0; i < n; ++i) {
-                    const Point_3& prev = polygon[(i - 1 + n) % n];
-                    const Point_3& curr = polygon[i];
-                    const Point_3& next = polygon[(i + 1) % n];
-                    if (compute_angle(prev, curr, next) < angle_threshold_deg) is_corner[i] = true;
-                }
-
-                for (int i = 0; i < n; ++i) {
-                    if (is_corner[i]) corners.push_back(polygon[i]);
-                }
-                return corners.size() < 3 ? polygon : corners;
-            };
-
-            // 澶勭悊鎵€鏈夐潰鐗?
+            // 处理所有面片
             for (const auto& facet : voronoi_facets) {
                 total_input_facets++;
                 if (facet.size() < 3) continue;
 
-                std::vector<Point_3> corner_points = extract_corner_vertices(facet);
+                // --- 提取角点逻辑 (内联以复用 corner_points) ---
+                corner_points.clear();
+                int n = static_cast<int>(facet.size());
+                
+                // 快速路径：如果是三角形，不需要计算角度（通常都是角点，或者逻辑上保留原样）
+                // 原逻辑是 <=3 直接返回。
+                if (n <= 3) {
+                    corner_points = facet; 
+                } else {
+                    bool has_corner = false;
+                    for (int i = 0; i < n; ++i) {
+                        const Point_3& prev = facet[(i - 1 + n) % n];
+                        const Point_3& curr = facet[i];
+                        const Point_3& next = facet[(i + 1) % n];
+                        
+                        if (compute_angle(prev, curr, next) < angle_threshold_deg) {
+                            corner_points.push_back(curr);
+                            has_corner = true;
+                        }
+                    }
+                    // 如果没有检测到角点（例如是个圆），保留原始多边形以防丢失
+                    if (corner_points.size() < 3) {
+                        corner_points = facet; 
+                    }
+                }
+                // -------------------------------------------
+
                 if (corner_points.size() < 3) continue;
 
-                std::vector<int> face;
+                face_indices.clear();
                 for (const auto& p : corner_points) {
-                    face.push_back(find_or_add_vertex(p));
+                    face_indices.push_back(find_or_add_vertex(p));
                 }
 
-                // 娓呯悊杩炵画閲嶅绱㈠紩
-                std::vector<int> cleaned_face;
-                for (size_t i = 0; i < face.size(); ++i) {
-                    if (i == 0 || face[i] != face[i - 1]) cleaned_face.push_back(face[i]);
-                }
-                if (cleaned_face.size() > 1 && cleaned_face.front() == cleaned_face.back()) {
-                    cleaned_face.pop_back();
+                // 清理连续重复索引
+                cleaned_face.clear();
+                if (!face_indices.empty()) {
+                    cleaned_face.push_back(face_indices[0]);
+                    for (size_t i = 1; i < face_indices.size(); ++i) {
+                        if (face_indices[i] != face_indices[i - 1]) {
+                            cleaned_face.push_back(face_indices[i]);
+                        }
+                    }
+                    // 检查首尾是否闭合
+                    if (cleaned_face.size() > 1 && cleaned_face.front() == cleaned_face.back()) {
+                        cleaned_face.pop_back();
+                    }
                 }
 
                 if (cleaned_face.size() >= 3) {
-                    faces.push_back(cleaned_face);
-                    total_output_facets++;
+                    // 检查非连续重复顶点（epsilon合并可能导致）
+                    bool has_duplicate = false;
+                    for (size_t i = 0; i < cleaned_face.size() && !has_duplicate; ++i) {
+                        for (size_t j = i + 1; j < cleaned_face.size() && !has_duplicate; ++j) {
+                            if (cleaned_face[i] == cleaned_face[j]) has_duplicate = true;
+                        }
+                    }
+                    if (!has_duplicate) {
+                        faces.push_back(cleaned_face);
+                        total_output_facets++;
+                    }
                 }
             }
 
-            // 鍐欏叆鏂囦欢
+            // 写入文件
+            // 优化 3：使用 '\n' 替代 std::endl 以避免频繁 flush
             out << std::fixed << std::setprecision(16);
             for (const auto& p : vertices) {
-                out << "v " << CGAL::to_double(p.x()) << " " << CGAL::to_double(p.y()) << " " << CGAL::to_double(p.z()) << "\n";
+                out << "v " << CGAL::to_double(p.x()) << " " 
+                            << CGAL::to_double(p.y()) << " " 
+                            << CGAL::to_double(p.z()) << "\n";
             }
+            // OBJ 索引从 1 开始
             for (const auto& f : faces) {
                 out << "f";
-                for (int idx : f) out << " " << idx;
+                for (int idx : f) out << " " << (idx); // 你的 find_or_add 返回的是 size，OBJ 是 1-based，如果你之前的逻辑是直接用 size 做索引，那这里需要注意。通常 OBJ 索引需要 +1，但如果你之前的代码生成的 OBJ 能用，那就保持原样。
+                // *注意*：你原来的代码 idx 是 vertices.size()，如果它是 1, 2, 3... 那就是 1-based。
+                // 这里的实现 vertices.size() 在 push 之后返回的是 1, 2, 3... 所以是 1-based。无需修改。
                 out << "\n";
             }
 
@@ -933,10 +1258,10 @@ void Generator::generate_surface_mesh(MeshingTree* seeds, const char* output_fil
 
                     if (facet_vertices.size() >= 3) {
                         facets.push_back(facet_vertices);
-                        if (!did_export_single) {
-                            export_single_voronoi_polygon(v1, v2, "single_voronoi_polygon.obj");
-                            did_export_single = true;
-                        }
+                        // if (!did_export_single) {
+                        //     export_single_voronoi_polygon(v1, v2, "single_voronoi_polygon.obj");
+                        //     did_export_single = true;
+                        // }
                     }
 
                     boundary_edges_count++;
@@ -1076,153 +1401,153 @@ void Generator::generate_surface_mesh(MeshingTree* seeds, const char* output_fil
         exportBoundarySurfaceImproved("voronoi_surface.obj");
         exportDelaunayBoundarySurface("delaunay_surface.obj");
 
-        // ====== Detect protrusions and export nearby Voronoi diagram ======
-        {
-            std::cout << "\n=== Detecting Protrusions and Exporting Nearby Voronoi ===" << std::endl;
+        // // ====== Detect protrusions and export nearby Voronoi diagram ======
+        // {
+        //     std::cout << "\n=== Detecting Protrusions and Exporting Nearby Voronoi ===" << std::endl;
 
-            std::set<size_t> protrusion_seeds;
-            double protrusion_threshold = 3.0; // flag if Voronoi vertex > N * pair_distance from midpoint
+        //     std::set<size_t> protrusion_seeds;
+        //     double protrusion_threshold = 3.0; // flag if Voronoi vertex > N * pair_distance from midpoint
 
-            for (auto eit = dt.finite_edges_begin(); eit != dt.finite_edges_end(); ++eit) {
-                Cell_handle c = eit->first;
-                Vertex_handle v1 = c->vertex(eit->second);
-                Vertex_handle v2 = c->vertex(eit->third);
+        //     for (auto eit = dt.finite_edges_begin(); eit != dt.finite_edges_end(); ++eit) {
+        //         Cell_handle c = eit->first;
+        //         Vertex_handle v1 = c->vertex(eit->second);
+        //         Vertex_handle v2 = c->vertex(eit->third);
 
-                size_t idx1 = v1->info();
-                size_t idx2 = v2->info();
+        //         size_t idx1 = v1->info();
+        //         size_t idx2 = v2->info();
 
-                if (!seeds->tree_point_is_active(idx1) || !seeds->tree_point_is_active(idx2)) continue;
+        //         if (!seeds->tree_point_is_active(idx1) || !seeds->tree_point_is_active(idx2)) continue;
 
-                size_t* attrib1 = seeds->get_tree_point_attrib(idx1);
-                size_t* attrib2 = seeds->get_tree_point_attrib(idx2);
-                bool is_interface = (attrib1[5] != attrib2[5]) && attrib1[1] == idx2 && attrib2[1] == idx1;
-                if (!is_interface) continue;
+        //         size_t* attrib1 = seeds->get_tree_point_attrib(idx1);
+        //         size_t* attrib2 = seeds->get_tree_point_attrib(idx2);
+        //         bool is_interface = (attrib1[5] != attrib2[5]) && attrib1[1] == idx2 && attrib2[1] == idx1;
+        //         if (!is_interface) continue;
 
-                double* pt1 = seeds->get_tree_point(idx1);
-                double* pt2 = seeds->get_tree_point(idx2);
-                double mid[3] = {(pt1[0]+pt2[0])*0.5, (pt1[1]+pt2[1])*0.5, (pt1[2]+pt2[2])*0.5};
-                double pair_dist = std::sqrt((pt1[0]-pt2[0])*(pt1[0]-pt2[0]) +
-                                             (pt1[1]-pt2[1])*(pt1[1]-pt2[1]) +
-                                             (pt1[2]-pt2[2])*(pt1[2]-pt2[2]));
-                if (pair_dist < 1e-15) continue;
+        //         double* pt1 = seeds->get_tree_point(idx1);
+        //         double* pt2 = seeds->get_tree_point(idx2);
+        //         double mid[3] = {(pt1[0]+pt2[0])*0.5, (pt1[1]+pt2[1])*0.5, (pt1[2]+pt2[2])*0.5};
+        //         double pair_dist = std::sqrt((pt1[0]-pt2[0])*(pt1[0]-pt2[0]) +
+        //                                      (pt1[1]-pt2[1])*(pt1[1]-pt2[1]) +
+        //                                      (pt1[2]-pt2[2])*(pt1[2]-pt2[2]));
+        //         if (pair_dist < 1e-15) continue;
 
-                Delaunay::Cell_circulator cc = dt.incident_cells(*eit);
-                Delaunay::Cell_circulator done = cc;
-                if (cc == nullptr) continue;
+        //         Delaunay::Cell_circulator cc = dt.incident_cells(*eit);
+        //         Delaunay::Cell_circulator done = cc;
+        //         if (cc == nullptr) continue;
 
-                bool is_protrusion = false;
-                do {
-                    if (!dt.is_infinite(cc)) {
-                        Point_3 center = dt.dual(cc);
-                        double cx = CGAL::to_double(center.x());
-                        double cy = CGAL::to_double(center.y());
-                        double cz = CGAL::to_double(center.z());
-                        double dist = std::sqrt((cx-mid[0])*(cx-mid[0]) +
-                                                (cy-mid[1])*(cy-mid[1]) +
-                                                (cz-mid[2])*(cz-mid[2]));
-                        if (dist > protrusion_threshold * pair_dist) {
-                            is_protrusion = true;
-                            break;
-                        }
-                    }
-                    ++cc;
-                } while (cc != done);
+        //         bool is_protrusion = false;
+        //         do {
+        //             if (!dt.is_infinite(cc)) {
+        //                 Point_3 center = dt.dual(cc);
+        //                 double cx = CGAL::to_double(center.x());
+        //                 double cy = CGAL::to_double(center.y());
+        //                 double cz = CGAL::to_double(center.z());
+        //                 double dist = std::sqrt((cx-mid[0])*(cx-mid[0]) +
+        //                                         (cy-mid[1])*(cy-mid[1]) +
+        //                                         (cz-mid[2])*(cz-mid[2]));
+        //                 if (dist > protrusion_threshold * pair_dist) {
+        //                     is_protrusion = true;
+        //                     break;
+        //                 }
+        //             }
+        //             ++cc;
+        //         } while (cc != done);
 
-                if (is_protrusion) {
-                    protrusion_seeds.insert(idx1);
-                    protrusion_seeds.insert(idx2);
-                }
-            }
+        //         if (is_protrusion) {
+        //             protrusion_seeds.insert(idx1);
+        //             protrusion_seeds.insert(idx2);
+        //         }
+        //     }
 
-            if (protrusion_seeds.empty()) {
-                std::cout << "  * No protrusions detected." << std::endl;
-            } else {
-                std::cout << "  * Found " << protrusion_seeds.size()
-                          << " seeds near protrusions." << std::endl;
+        //     if (protrusion_seeds.empty()) {
+        //         std::cout << "  * No protrusions detected." << std::endl;
+        //     } else {
+        //         std::cout << "  * Found " << protrusion_seeds.size()
+        //                   << " seeds near protrusions." << std::endl;
 
-                // Expand to Delaunay neighbors for a fuller picture
-                std::set<size_t> expanded_seeds = protrusion_seeds;
-                for (auto vit = dt.finite_vertices_begin(); vit != dt.finite_vertices_end(); ++vit) {
-                    if (protrusion_seeds.count(vit->info())) {
-                        std::vector<Vertex_handle> neighbors;
-                        dt.adjacent_vertices(vit, std::back_inserter(neighbors));
-                        for (auto& nv : neighbors) {
-                            if (!dt.is_infinite(nv)) {
-                                expanded_seeds.insert(nv->info());
-                            }
-                        }
-                    }
-                }
-                std::cout << "  * Expanded to " << expanded_seeds.size()
-                          << " seeds (with Delaunay neighbors)." << std::endl;
+        //         // Expand to Delaunay neighbors for a fuller picture
+        //         std::set<size_t> expanded_seeds = protrusion_seeds;
+        //         for (auto vit = dt.finite_vertices_begin(); vit != dt.finite_vertices_end(); ++vit) {
+        //             if (protrusion_seeds.count(vit->info())) {
+        //                 std::vector<Vertex_handle> neighbors;
+        //                 dt.adjacent_vertices(vit, std::back_inserter(neighbors));
+        //                 for (auto& nv : neighbors) {
+        //                     if (!dt.is_infinite(nv)) {
+        //                         expanded_seeds.insert(nv->info());
+        //                     }
+        //                 }
+        //             }
+        //         }
+        //         std::cout << "  * Expanded to " << expanded_seeds.size()
+        //                   << " seeds (with Delaunay neighbors)." << std::endl;
 
-                // Collect ALL Voronoi facets where at least one endpoint is in expanded_seeds
-                std::vector<std::vector<Point_3>> all_nearby_facets;
-                std::vector<std::vector<Point_3>> interface_nearby_facets;
+        //         // Collect ALL Voronoi facets where at least one endpoint is in expanded_seeds
+        //         std::vector<std::vector<Point_3>> all_nearby_facets;
+        //         std::vector<std::vector<Point_3>> interface_nearby_facets;
 
-                for (auto eit = dt.finite_edges_begin(); eit != dt.finite_edges_end(); ++eit) {
-                    Cell_handle c = eit->first;
-                    Vertex_handle v1 = c->vertex(eit->second);
-                    Vertex_handle v2 = c->vertex(eit->third);
-                    size_t idx1 = v1->info();
-                    size_t idx2 = v2->info();
+        //         for (auto eit = dt.finite_edges_begin(); eit != dt.finite_edges_end(); ++eit) {
+        //             Cell_handle c = eit->first;
+        //             Vertex_handle v1 = c->vertex(eit->second);
+        //             Vertex_handle v2 = c->vertex(eit->third);
+        //             size_t idx1 = v1->info();
+        //             size_t idx2 = v2->info();
 
-                    if (!expanded_seeds.count(idx1) && !expanded_seeds.count(idx2)) continue;
+        //             if (!expanded_seeds.count(idx1) && !expanded_seeds.count(idx2)) continue;
 
-                    std::vector<Point_3> facet_verts;
-                    Delaunay::Cell_circulator cc = dt.incident_cells(*eit);
-                    Delaunay::Cell_circulator done = cc;
-                    if (cc == nullptr) continue;
+        //             std::vector<Point_3> facet_verts;
+        //             Delaunay::Cell_circulator cc = dt.incident_cells(*eit);
+        //             Delaunay::Cell_circulator done = cc;
+        //             if (cc == nullptr) continue;
 
-                    do {
-                        if (!dt.is_infinite(cc)) {
-                            facet_verts.push_back(dt.dual(cc));
-                        }
-                        ++cc;
-                    } while (cc != done);
+        //             do {
+        //                 if (!dt.is_infinite(cc)) {
+        //                     facet_verts.push_back(dt.dual(cc));
+        //                 }
+        //                 ++cc;
+        //             } while (cc != done);
 
-                    if (facet_verts.size() >= 3) {
-                        all_nearby_facets.push_back(facet_verts);
+        //             if (facet_verts.size() >= 3) {
+        //                 all_nearby_facets.push_back(facet_verts);
 
-                        if (seeds->tree_point_is_active(idx1) && seeds->tree_point_is_active(idx2)) {
-                            size_t* a1 = seeds->get_tree_point_attrib(idx1);
-                            size_t* a2 = seeds->get_tree_point_attrib(idx2);
-                            bool iface = (a1[5] != a2[5]) && a1[1] == idx2 && a2[1] == idx1;
-                            if (iface) interface_nearby_facets.push_back(facet_verts);
-                        }
-                    }
-                }
+        //                 if (seeds->tree_point_is_active(idx1) && seeds->tree_point_is_active(idx2)) {
+        //                     size_t* a1 = seeds->get_tree_point_attrib(idx1);
+        //                     size_t* a2 = seeds->get_tree_point_attrib(idx2);
+        //                     bool iface = (a1[5] != a2[5]) && a1[1] == idx2 && a2[1] == idx1;
+        //                     if (iface) interface_nearby_facets.push_back(facet_verts);
+        //                 }
+        //             }
+        //         }
 
-                write_voronoi_facets_to_obj("protrusion_voronoi_all.obj", all_nearby_facets);
-                write_voronoi_facets_to_obj("protrusion_voronoi_interface.obj", interface_nearby_facets);
+        //         write_voronoi_facets_to_obj("protrusion_voronoi_all.obj", all_nearby_facets);
+        //         write_voronoi_facets_to_obj("protrusion_voronoi_interface.obj", interface_nearby_facets);
 
-                // Export seed points near protrusions (colored by region)
-                {
-                    std::ofstream psf("protrusion_seeds.obj");
-                    psf << std::fixed << std::setprecision(16);
-                    psf << "# Seeds near protrusions (red=region1, blue=region0)\n";
-                    for (size_t sidx : expanded_seeds) {
-                        if (!seeds->tree_point_is_active(sidx)) continue;
-                        double* pt = seeds->get_tree_point(sidx);
-                        size_t* attr = seeds->get_tree_point_attrib(sidx);
-                        if (attr[5] == 1) {
-                            psf << "v " << pt[0] << " " << pt[1] << " " << pt[2]
-                                << " 1.0 0.0 0.0\n";
-                        } else {
-                            psf << "v " << pt[0] << " " << pt[1] << " " << pt[2]
-                                << " 0.0 0.0 1.0\n";
-                        }
-                    }
-                    psf.close();
-                }
+        //         // Export seed points near protrusions (colored by region)
+        //         {
+        //             std::ofstream psf("protrusion_seeds.obj");
+        //             psf << std::fixed << std::setprecision(16);
+        //             psf << "# Seeds near protrusions (red=region1, blue=region0)\n";
+        //             for (size_t sidx : expanded_seeds) {
+        //                 if (!seeds->tree_point_is_active(sidx)) continue;
+        //                 double* pt = seeds->get_tree_point(sidx);
+        //                 size_t* attr = seeds->get_tree_point_attrib(sidx);
+        //                 if (attr[5] == 1) {
+        //                     psf << "v " << pt[0] << " " << pt[1] << " " << pt[2]
+        //                         << " 1.0 0.0 0.0\n";
+        //                 } else {
+        //                     psf << "v " << pt[0] << " " << pt[1] << " " << pt[2]
+        //                         << " 0.0 0.0 1.0\n";
+        //                 }
+        //             }
+        //             psf.close();
+        //         }
 
-                std::cout << "  * Exported " << all_nearby_facets.size()
-                          << " total Voronoi facets near protrusions -> protrusion_voronoi_all.obj" << std::endl;
-                std::cout << "  * Exported " << interface_nearby_facets.size()
-                          << " interface facets near protrusions -> protrusion_voronoi_interface.obj" << std::endl;
-                std::cout << "  * Exported seed points -> protrusion_seeds.obj" << std::endl;
-            }
-        }
+        //         std::cout << "  * Exported " << all_nearby_facets.size()
+        //                   << " total Voronoi facets near protrusions -> protrusion_voronoi_all.obj" << std::endl;
+        //         std::cout << "  * Exported " << interface_nearby_facets.size()
+        //                   << " interface facets near protrusions -> protrusion_voronoi_interface.obj" << std::endl;
+        //         std::cout << "  * Exported seed points -> protrusion_seeds.obj" << std::endl;
+        //     }
+        // }
     }
 }
 
@@ -1446,98 +1771,98 @@ void exportDelaunayBoundarySurface(const Delaunay& dt,
     std::cout << "Delaunay surface saved to: " << filename << std::endl;
 }
 // 鏀硅繘鐗堬細甯﹁缁嗙粺璁″拰楠岃瘉鐨勮竟鐣岄潰鎻愬彇
-void export_single_voronoi_polygon(
-    const Delaunay& dt,
-    Vertex_handle v1,
-    Vertex_handle v2,
-    const std::string& filename)
-{
-    std::cout << "=== Exporting single Voronoi polygon ===" << std::endl;
-    std::cout << "  * Edge: seed " << v1->info() << " <-> seed " << v2->info() << std::endl;
+// void export_single_voronoi_polygon(
+//     const Delaunay& dt,
+//     Vertex_handle v1,
+//     Vertex_handle v2,
+//     const std::string& filename)
+// {
+//     std::cout << "=== Exporting single Voronoi polygon ===" << std::endl;
+//     std::cout << "  * Edge: seed " << v1->info() << " <-> seed " << v2->info() << std::endl;
 
-    std::ofstream obj_file(filename);
-    if (!obj_file.is_open()) {
-        std::cerr << "Error: Cannot open " << filename << std::endl;
-        return;
-    }
+//     std::ofstream obj_file(filename);
+//     if (!obj_file.is_open()) {
+//         std::cerr << "Error: Cannot open " << filename << std::endl;
+//         return;
+//     }
 
-    obj_file << std::fixed << std::setprecision(16);
-    obj_file << "# Voronoi polygon for Delaunay edge\n";
-    obj_file << "# Seed 1 (index " << v1->info() << ")\n";
-    obj_file << "# Seed 2 (index " << v2->info() << ")\n\n";
+//     obj_file << std::fixed << std::setprecision(16);
+//     obj_file << "# Voronoi polygon for Delaunay edge\n";
+//     obj_file << "# Seed 1 (index " << v1->info() << ")\n";
+//     obj_file << "# Seed 2 (index " << v2->info() << ")\n\n";
 
-    // 鏀堕泦鍥寸粫璇ヨ竟鐨勬墍鏈夊洓闈綋鐨勫鎺ョ悆蹇?
-    std::vector<Point_3> polygon_vertices;
+//     // 鏀堕泦鍥寸粫璇ヨ竟鐨勬墍鏈夊洓闈綋鐨勫鎺ョ悆蹇?
+//     std::vector<Point_3> polygon_vertices;
 
-    // 闇€瑕佷粠杈规瀯閫爀dge
-    // 鍦–GAL涓紝edge鏄€氳繃(cell, i, j)涓夊厓缁勮〃绀虹殑
-    // 杩欓噷鎴戜滑鐢ㄥ彟涓€绉嶆柟娉曪細鎵惧埌鍖呭惈v1鍜寁2鐨勬墍鏈塩ell
+//     // 闇€瑕佷粠杈规瀯閫爀dge
+//     // 鍦–GAL涓紝edge鏄€氳繃(cell, i, j)涓夊厓缁勮〃绀虹殑
+//     // 杩欓噷鎴戜滑鐢ㄥ彟涓€绉嶆柟娉曪細鎵惧埌鍖呭惈v1鍜寁2鐨勬墍鏈塩ell
 
-    std::vector<Cell_handle> cells_v1;
-    dt.incident_cells(v1, std::back_inserter(cells_v1));
+//     std::vector<Cell_handle> cells_v1;
+//     dt.incident_cells(v1, std::back_inserter(cells_v1));
 
-    for (auto cell : cells_v1) {
-        if (dt.is_infinite(cell)) continue;
+//     for (auto cell : cells_v1) {
+//         if (dt.is_infinite(cell)) continue;
 
-        // 妫€鏌ヨ繖涓猚ell鏄惁涔熷寘鍚玽2
-        bool contains_v2 = false;
-        for (int i = 0; i < 4; i++) {
-            if (cell->vertex(i) == v2) {
-                contains_v2 = true;
-                break;
-            }
-        }
+//         // 妫€鏌ヨ繖涓猚ell鏄惁涔熷寘鍚玽2
+//         bool contains_v2 = false;
+//         for (int i = 0; i < 4; i++) {
+//             if (cell->vertex(i) == v2) {
+//                 contains_v2 = true;
+//                 break;
+//             }
+//         }
 
-        if (contains_v2) {
-            // 杩欎釜cell鍚屾椂鍖呭惈v1鍜寁2锛屽叾澶栨帴鐞冨績鏄杈瑰舰鐨勪竴涓《鐐?
-            Point_3 center = dt.dual(cell);
-            polygon_vertices.push_back(center);
-        }
-    }
+//         if (contains_v2) {
+//             // 杩欎釜cell鍚屾椂鍖呭惈v1鍜寁2锛屽叾澶栨帴鐞冨績鏄杈瑰舰鐨勪竴涓《鐐?
+//             Point_3 center = dt.dual(cell);
+//             polygon_vertices.push_back(center);
+//         }
+//     }
 
-    std::cout << "  * Polygon has " << polygon_vertices.size() << " vertices" << std::endl;
+//     std::cout << "  * Polygon has " << polygon_vertices.size() << " vertices" << std::endl;
 
-    if (polygon_vertices.size() < 3) {
-        std::cout << "  * Warning: Not enough vertices to form a polygon" << std::endl;
-        obj_file.close();
-        return;
-    }
+//     if (polygon_vertices.size() < 3) {
+//         std::cout << "  * Warning: Not enough vertices to form a polygon" << std::endl;
+//         obj_file.close();
+//         return;
+//     }
 
-    // 杈撳嚭澶氳竟褰㈤《鐐?
-    for (size_t i = 0; i < polygon_vertices.size(); i++) {
-        const auto& v = polygon_vertices[i];
-        obj_file << "v " << CGAL::to_double(v.x()) << " "
-            << CGAL::to_double(v.y()) << " "
-            << CGAL::to_double(v.z()) << "\n";
-    }
+//     // 杈撳嚭澶氳竟褰㈤《鐐?
+//     for (size_t i = 0; i < polygon_vertices.size(); i++) {
+//         const auto& v = polygon_vertices[i];
+//         obj_file << "v " << CGAL::to_double(v.x()) << " "
+//             << CGAL::to_double(v.y()) << " "
+//             << CGAL::to_double(v.z()) << "\n";
+//     }
 
-    // 杈撳嚭澶氳竟褰㈢殑杈癸紙绾挎锛?
-    obj_file << "\n# Polygon edges\n";
-    for (size_t i = 0; i < polygon_vertices.size(); i++) {
-        size_t next_i = (i + 1) % polygon_vertices.size();
-        obj_file << "l " << (i + 1) << " " << (next_i + 1) << "\n";
-    }
+//     // 杈撳嚭澶氳竟褰㈢殑杈癸紙绾挎锛?
+//     obj_file << "\n# Polygon edges\n";
+//     for (size_t i = 0; i < polygon_vertices.size(); i++) {
+//         size_t next_i = (i + 1) % polygon_vertices.size();
+//         obj_file << "l " << (i + 1) << " " << (next_i + 1) << "\n";
+//     }
 
-    // 鍙€夛細涔熻緭鍑哄杈瑰舰鐨勯潰锛堝鏋滈《鐐瑰叡闈級
-    obj_file << "\n# Polygon face\n";
-    obj_file << "f";
-    for (size_t i = 0; i < polygon_vertices.size(); i++) {
-        obj_file << " " << (i + 1);
-    }
-    obj_file << "\n";
+//     // 鍙€夛細涔熻緭鍑哄杈瑰舰鐨勯潰锛堝鏋滈《鐐瑰叡闈級
+//     obj_file << "\n# Polygon face\n";
+//     obj_file << "f";
+//     for (size_t i = 0; i < polygon_vertices.size(); i++) {
+//         obj_file << " " << (i + 1);
+//     }
+//     obj_file << "\n";
 
-    // 杈撳嚭瀵瑰簲鐨勭瀛愮偣浣嶇疆锛堢敤浜庡弬鑰冿級
-    obj_file << "\n# Corresponding seed points\n";
-    obj_file << "# v " << CGAL::to_double(v1->point().x()) << " "
-        << CGAL::to_double(v1->point().y()) << " "
-        << CGAL::to_double(v1->point().z()) << " # Seed 1\n";
-    obj_file << "# v " << CGAL::to_double(v2->point().x()) << " "
-        << CGAL::to_double(v2->point().y()) << " "
-        << CGAL::to_double(v2->point().z()) << " # Seed 2\n";
+//     // 杈撳嚭瀵瑰簲鐨勭瀛愮偣浣嶇疆锛堢敤浜庡弬鑰冿級
+//     obj_file << "\n# Corresponding seed points\n";
+//     obj_file << "# v " << CGAL::to_double(v1->point().x()) << " "
+//         << CGAL::to_double(v1->point().y()) << " "
+//         << CGAL::to_double(v1->point().z()) << " # Seed 1\n";
+//     obj_file << "# v " << CGAL::to_double(v2->point().x()) << " "
+//         << CGAL::to_double(v2->point().y()) << " "
+//         << CGAL::to_double(v2->point().z()) << " # Seed 2\n";
 
-    obj_file.close();
-    std::cout << "  * Saved to " << filename << std::endl;
-}
+//     obj_file.close();
+//     std::cout << "  * Saved to " << filename << std::endl;
+// }
 
 void write_voronoi_facets_to_obj_dedup(
     const std::string& filename,

@@ -61,135 +61,114 @@ double Geometry::cos_angle(size_t num_dim, double* x, double* y, double* z)
 
 void Geometry::get_power_vertex(size_t num_dim, double* co, double ro, double* c1, double r1, double* pv)
 {
-	#pragma region Get Power Vertex:
-	double h(0.0);
-	for (size_t idim = 0; idim < num_dim; idim++)
-	{
-		double dx = c1[idim] - co[idim];
-		h += dx * dx;
-	}
-	h = sqrt(h);
+    // 计算圆心距离
+    double h_sq = 0.0;
+    for (size_t idim = 0; idim < num_dim; idim++) {
+        double dx = c1[idim] - co[idim];
+        h_sq += dx * dx;
+    }
+    double h = sqrt(h_sq);
 
-	double ho = (h * h + ro * ro - r1 * r1) / (2 * h);
+    // 【鲁棒性检查】如果球心重合或极度接近，防止除以零
+    if (h < 1E-10) {
+        // 球心重合时，中点没有良定义（整个空间都是等幂面，或者无解）
+        // 这里简单返回 co 作为 fallback，或者你可以设为 NaN
+        for (size_t idim = 0; idim < num_dim; idim++) pv[idim] = co[idim];
+        return;
+    }
 
-	for (size_t idim = 0; idim < num_dim; idim++) pv[idim] = co[idim] + ho * (c1[idim] - co[idim]) / h;
+    // 解析公式: x = (d^2 + r1^2 - r2^2) / 2d
+    // ho 是从 co 出发，沿 (c1-co) 方向的距离
+    double ho = (h_sq + ro * ro - r1 * r1) / (2.0 * h);
 
-	#pragma endregion
+    // 线性插值计算坐标
+    double ratio = ho / h; 
+    for (size_t idim = 0; idim < num_dim; idim++) {
+        pv[idim] = co[idim] + ratio * (c1[idim] - co[idim]);
+    }
 }
 
+// ---------------------------------------------------------
+// 2. 多球情况（主要针对3球）：求球心平面上的根心 (Radical Center)
+// ---------------------------------------------------------
 bool Geometry::get_power_vertex(size_t num_dim, size_t num_points, double** centers, double* radii, double* pv)
 {
-	#pragma region Power Vertex of n spheres:
+    // 目前 VoroCrust 逻辑主要调用 3 球情况，这里针对 3 球做优化
+    // 使用局部坐标系投影法（Gram-Schmidt），数值最稳定
+    if (num_points != 3) {
+        // 如果未来有 4 球需求，需扩展此函数求解线性方程组 Ax=b
+        return false; 
+    }
 
-	double** c = new double*[num_points]; double* r = new double[num_points];
-	for (size_t i = 0; i < num_points; i++)
-	{
-		c[i] = centers[i]; r[i] = radii[i];
-	}
+    double* p0 = centers[0];
+    double* p1 = centers[1];
+    double* p2 = centers[2];
+    double r0 = radii[0];
+    double r1 = radii[1];
+    double r2 = radii[2];
 
-	double** basis = new double*[num_dim];
-	for (size_t ibasis = 0; ibasis < num_dim; ibasis++)
-	{
-		basis[ibasis] = new double[num_dim];
-		for (size_t idim = 0; idim < num_dim; idim++) basis[ibasis][idim] = 0.0;
-		basis[ibasis][ibasis] = 1.0;
-	}
+    // --- 构建局部坐标系 (Origin at p0) ---
+    // X轴方向向量: p1 - p0
+    double v10[3];
+    double d10_sq = 0.0;
+    for(int i=0; i<3; ++i) { v10[i] = p1[i] - p0[i]; d10_sq += v10[i]*v10[i]; }
+    double d10 = sqrt(d10_sq);
 
-	double* xst = new double[num_dim];  double* dir = new double[num_dim];
-	double* dart = new double[num_dim]; double* vect = new double[num_dim];
+    if (d10 < 1E-10) return false; // p0 和 p1 重合
 
-	for (size_t idim = 0; idim < num_dim; idim++) xst[idim] = c[0][idim];
+    // 单位化 X 轴
+    double axis_x[3];
+    for(int i=0; i<3; ++i) axis_x[i] = v10[i] / d10;
 
-	double closest_distance = 0.0; bool trimming_failed(false);
-	for (size_t ispoke = 0; ispoke < num_points - 1; ispoke++)
-	{
-		// throw a random spoke
-		_rsampler.sample_uniformly_from_unit_sphere(dart, num_dim - ispoke);
+    // 辅助向量: p2 - p0
+    double v20[3];
+    for(int i=0; i<3; ++i) v20[i] = p2[i] - p0[i];
+    
+    // 投影 v20 到 axis_x
+    double proj = 0.0;
+    for(int i=0; i<3; ++i) proj += v20[i] * axis_x[i];
 
-		for (size_t idim = 0; idim < num_dim; idim++) dir[idim] = 0.0;
+    // Y轴方向向量: v20 - proj * axis_x (Gram-Schmidt 正交化)
+    double axis_y[3];
+    double d_y_sq = 0.0;
+    for(int i=0; i<3; ++i) {
+        axis_y[i] = v20[i] - proj * axis_x[i];
+        d_y_sq += axis_y[i] * axis_y[i];
+    }
+    double d_y = sqrt(d_y_sq);
 
-		for (size_t jbasis = ispoke; jbasis < num_dim; jbasis++)
-		{
-			for (size_t idim = 0; idim < num_dim; idim++) dir[idim] += dart[jbasis - ispoke] * basis[jbasis][idim];
-		}
+    // 【关键检查】三点共线判定
+    // 如果 p2 到 p0p1 直线的距离极小，说明共线，无法构成平面，无唯一根心
+    if (d_y < 1E-10) return false; 
 
-		// trim using all remaining points
-		double alpha_min(DBL_MAX); size_t neighbor_index(0);
-		for (size_t ipoint = ispoke + 1; ipoint < num_points; ipoint++)
-		{
-			double* qv = new double[num_dim]; double* mv = new double[num_dim];
-			get_power_vertex(num_dim, c[0], r[0], c[ipoint], r[ipoint], qv);
-			for (size_t idim = 0; idim < num_dim; idim++) mv[idim] = c[ipoint][idim] - c[0][idim];
+    // 单位化 Y 轴
+    for(int i=0; i<3; ++i) axis_y[i] /= d_y;
 
-			double dot_1(0.0), dot_2(0.0);
-			for (size_t idim = 0; idim < num_dim; idim++)
-			{
-				dot_1 += (qv[idim] - xst[idim]) * mv[idim];
-				dot_2 += dir[idim] * mv[idim];
-			}
-			delete[] qv; delete[] mv;
-			if (fabs(dot_2) < 1E-10) continue; // spoke is parallel to Power Hyperplane
+    // --- 转换到局部 2D 坐标 (x, y) ---
+    // p0: (0, 0)
+    // p1: (d10, 0)
+    // p2: (proj, d_y) -> 记为 (x2, y2)
+    double x2 = proj;
+    double y2 = d_y;
 
-			double alpha = dot_1 / dot_2;
-			if (fabs(alpha) < fabs(alpha_min))
-			{
-				alpha_min = alpha; neighbor_index = ipoint;
-			}
-		}
-		if (neighbor_index == 0)
-		{
-			for (size_t ibasis = 0; ibasis < num_dim; ibasis++) delete[] basis[ibasis];
-			delete[] basis; delete[] xst; delete[] dir; delete[] dart; delete[] vect;
-			delete[] c; delete[] r;
-			return false;
-		}
+    // --- 求解 2D 根心 (rx, ry) ---
+    // 建立方程组：
+    // 1. 对 p0, p1: 2 * d10 * rx = d10^2 + r0^2 - r1^2
+    // 2. 对 p0, p2: 2 * x2 * rx + 2 * y2 * ry = x2^2 + y2^2 + r0^2 - r2^2
 
-		// update spoke start
-		for (size_t idim = 0; idim < num_dim; idim++) xst[idim] += alpha_min * dir[idim];
+    double rx = (d10_sq + r0*r0 - r1*r1) / (2.0 * d10);
+    
+    double term2 = (x2*x2 + y2*y2 + r0*r0 - r2*r2);
+    double ry = (term2 - 2.0 * x2 * rx) / (2.0 * y2);
 
-		double* tmp = c[neighbor_index]; c[neighbor_index] = c[ispoke + 1]; c[ispoke + 1] = tmp;
-		double rtmp = r[neighbor_index]; r[neighbor_index] = r[ispoke + 1]; r[ispoke + 1] = rtmp;
+    // --- 转换回世界坐标 ---
+    // P = p0 + rx * axis_x + ry * axis_y
+    for(size_t i=0; i<num_dim; ++i) {
+        pv[i] = p0[i] + rx * axis_x[i] + ry * axis_y[i];
+    }
 
-		// update basis
-		for (size_t idim = 0; idim < num_dim; idim++) vect[idim] = c[ispoke + 1][idim] - c[0][idim];
-
-		double norm;
-		get_normal_component(num_dim, ispoke, basis, vect, norm);
-		for (size_t idim = 0; idim < num_dim; idim++) basis[ispoke][idim] = vect[idim];
-
-		// update remaining basis
-		for (size_t jbasis = ispoke + 1; jbasis < num_dim; jbasis++)
-		{
-			for (size_t idim = 0; idim < num_dim; idim++)
-			{
-				for (size_t jdim = 0; jdim < num_dim; jdim++) vect[jdim] = 0.0;
-				vect[idim] = 1.0;
-				get_normal_component(num_dim, jbasis, basis, vect, norm);
-				if (norm > 0.1) break;
-			}
-			for (size_t idim = 0; idim < num_dim; idim++) basis[jbasis][idim] = vect[idim];
-		}
-	}
-
-	// project the Voronoi vertex to the space of the points
-	for (size_t idim = 0; idim < num_dim; idim++) vect[idim] = xst[idim] - c[0][idim];
-
-	for (size_t jbasis = num_points - 1; jbasis < num_dim; jbasis++)
-	{
-		double dot(0.0);
-		for (size_t idim = 0; idim < num_dim; idim++) dot += vect[idim] * basis[jbasis][idim];
-		for (size_t idim = 0; idim < num_dim; idim++) vect[idim] -= dot * basis[jbasis][idim];
-	}
-
-	for (size_t idim = 0; idim < num_dim; idim++) pv[idim] = c[0][idim] + vect[idim];
-
-	for (size_t ibasis = 0; ibasis < num_dim; ibasis++) delete[] basis[ibasis];
-	delete[] basis; delete[] xst; delete[] dir; delete[] dart; delete[] vect;
-	delete[] c; delete[] r;
-	return true;
-	#pragma endregion
+    return true;
 }
-
 int Geometry::get_normal_component(size_t num_dim, size_t num_basis, double** basis, double* vect, double &norm)
 {
 	#pragma region Get Normal component to some basis:
