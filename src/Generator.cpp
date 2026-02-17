@@ -221,7 +221,7 @@ void Generator::read_obj_faces(const char* filename, std::vector<int>& faces_fla
 }
 
 void Generator::generate_surface_seeds(size_t num_points, double **points, size_t num_faces, size_t **faces,
-         MeshingTree *spheres,MeshingTree *upper_seeds, MeshingTree *lower_seeds, size_t number_of_facets, std::vector<int> faces_flat)
+         MeshingTree *spheres, MeshingTree *upper_seeds, MeshingTree *lower_seeds, size_t number_of_facets, std::vector<int> faces_flat)
 {
     // Memory allocation
     double* sphere_i = new double[4];
@@ -235,299 +235,224 @@ void Generator::generate_surface_seeds(size_t num_points, double **points, size_
     double* upper_seed = new double[4];
     double* lower_seed = new double[4];
     
+    // 辅助变量：用于优化循环中的临时计算
+    double* temp_c_ijk = new double[3]; 
+    
+    // 几何辅助
+    double* fi_corners[3];
+    double fi_normal[3];
+
     std::vector<size_t> attrib;
     attrib.resize(6);
     attrib[0] = 6, attrib[5] = 0;
+
+    size_t num_spheres_total = spheres->get_num_tree_points();
+
+    // 辅助 Lambda：检查当前球体配置是否合法，并计算 vi
+    // 返回 true 表示合法且有交点，同时输出 vi 和 c_ijk
+    auto check_configuration = [&](double* s_i, double* s_j, double* s_k, double& out_vi, double* out_c) -> bool {
+        // 1. 两两相交检查 (宽松检查，允许微小误差)
+        if (_geom.distance(3, s_i, s_j) > s_i[3] + s_j[3] + 1E-10) return false;
+        if (_geom.distance(3, s_i, s_k) > s_i[3] + s_k[3] + 1E-10) return false;
+        if (_geom.distance(3, s_j, s_k) > s_j[3] + s_k[3] + 1E-10) return false;
+
+        // 2. 计算根心 (Power Vertex)
+        double* ctrs[3] = {s_i, s_j, s_k};
+        double rs[3] = {s_i[3], s_j[3], s_k[3]};
+        if (!_geom.get_power_vertex(3, 3, ctrs, rs, out_c)) return false;
+
+        // 3. 检查根心是否在球内 (深度检查)
+        double hi = _geom.distance(3, out_c, s_i);
+        // 如果 hi > r，说明根心在球外，无公共交集
+        if (hi > s_i[3] - 1e-10) return false;
+
+        // 4. 计算垂直距离 vi
+        out_vi = sqrt(fmax(0.0, s_i[3] * s_i[3] - hi * hi));
+        return true;
+    };
+
     for(int i = 0; i < number_of_facets; i++)
     {
         int i_sphere = faces_flat[i * 3];
         int j_sphere = faces_flat[i * 3 + 1];
         int k_sphere = faces_flat[i * 3 + 2];
 
-        // Bounds check
-        size_t num_spheres = spheres->get_num_tree_points();
-        if (i_sphere < 0 || (size_t)i_sphere >= num_spheres ||
-            j_sphere < 0 || (size_t)j_sphere >= num_spheres ||
-            k_sphere < 0 || (size_t)k_sphere >= num_spheres) {
-            std::cerr << "[Error] Sphere index out of bounds in face " << i 
-                      << ": " << i_sphere << ", " << j_sphere << ", " << k_sphere 
-                      << " (total spheres: " << num_spheres << ")" << std::endl;
+        // 边界检查
+        if (i_sphere < 0 || (size_t)i_sphere >= num_spheres_total ||
+            j_sphere < 0 || (size_t)j_sphere >= num_spheres_total ||
+            k_sphere < 0 || (size_t)k_sphere >= num_spheres_total) {
             continue;
         }
 
-        bool failed = false;
-
-        // 1. Load Spheres
+        // 1. 加载原始球体数据
         spheres->get_tree_point(i_sphere, 4, sphere_i);
         spheres->get_tree_point(j_sphere, 4, sphere_j);
         spheres->get_tree_point(k_sphere, 4, sphere_k);
 
-        // 2. Pairwise overlapping checks
-        // Relaxed check: Allow touching (tangent) spheres. Only fail if strictly separated.
-        // Using +1E-10 allows for slight numerical error where dist is slightly > sum_radii
-        double dst_ij = _geom.distance(3, sphere_i, sphere_j);
-        if (dst_ij > sphere_i[3] + sphere_j[3] + 1E-10) failed = true;
+        // 2. 检查共线 (这是一个硬性几何约束，半径扩大无法解决共线问题，直接跳过)
+        centers[0] = sphere_i; centers[1] = sphere_j; centers[2] = sphere_k;
+        if (_geom.get_3d_triangle_area(centers) < 1E-10) continue;
 
-        if (!failed) {
-            double dst_ik = _geom.distance(3, sphere_i, sphere_k);
-            if (dst_ik > sphere_i[3] + sphere_k[3] + 1E-10) failed = true;
-        }
-        if (!failed) {
-            double dst_jk = _geom.distance(3, sphere_j, sphere_k);
-            if (dst_jk > sphere_j[3] + sphere_k[3] + 1E-10) failed = true;
-        }
+        // 3. 初始状态评估
+        double current_vi = 0.0;
+        bool is_valid = check_configuration(sphere_i, sphere_j, sphere_k, current_vi, c_ijk);
 
-        double vi = 0.0;
-        
-        // 3. Compute Radical Center (Power Vertex)
-        if (!failed) {
-            centers[0] = sphere_i; centers[1] = sphere_j; centers[2] = sphere_k;
-            radii[0] = sphere_i[3]; radii[1] = sphere_j[3]; radii[2] = sphere_k[3];
-            
-            bool pv_valid = _geom.get_power_vertex(3, 3, centers, radii, c_ijk);
-            
-            if (!pv_valid) {
-                failed = true;
-            } else {
-                double hi = _geom.distance(3, c_ijk, sphere_i);
-                
-                if (hi > sphere_i[3] - 1e-10) { 
-                    failed = true;
-                } else {
-                    // Safe sqrt: if hi > radius (but within tolerance), clamp to 0 (tangent point)
-                    vi = sqrt(fmax(0.0, sphere_i[3] * sphere_i[3] - hi * hi));
-                    
-                    if (vi < 1e-4) vi = 1e-4;
+        // 4. 判断是否需要修复
+        // 条件：如果不合法(无交点) 或者 种子距离过近(vi < 1e-4, 即总距离 < 2e-4)
+        // 目标：让 vi 至少达到 1.0001e-4
+        double target_vi = 1.0001e-4;
+        bool needs_fix = (!is_valid) || (current_vi < 1e-4);
+
+        if (needs_fix) {
+            // === 优化流程：寻找最佳球体进行扩大 ===
+            int best_sphere_idx = -1;
+            double best_new_radius = -1.0;
+            double min_radius_delta = DBL_MAX;
+
+            int sphere_indices[3] = {i_sphere, j_sphere, k_sphere};
+
+            // 遍历面上的三个球，分别尝试扩大
+            for (int k = 0; k < 3; ++k) {
+                int target_idx = sphere_indices[k];
+                double* target_ptr = spheres->get_tree_point(target_idx);
+                double r_orig = target_ptr[3];
+
+                // 准备临时球体数据进行模拟
+                spheres->get_tree_point(i_sphere, 4, sphere_i);
+                spheres->get_tree_point(j_sphere, 4, sphere_j);
+                spheres->get_tree_point(k_sphere, 4, sphere_k);
+                // 找到当前循环要修改的那个球的本地副本
+                double* sim_target = (k == 0) ? sphere_i : ((k == 1) ? sphere_j : sphere_k);
+
+                // 二分查找：找到最小的 r 使得 configuration valid 且 vi >= target_vi
+                // 搜索范围：[r_orig, r_orig * 2.0]
+                double r_low = r_orig;
+                double r_high = r_orig * 2.0; 
+                double r_found = -1.0;
+
+                for (int iter = 0; iter < 20; ++iter) {
+                    double r_mid = (r_low + r_high) * 0.5;
+                    sim_target[3] = r_mid; // 修改半径
+
+                    double temp_vi = 0.0;
+                    bool ok = check_configuration(sphere_i, sphere_j, sphere_k, temp_vi, temp_c_ijk);
+
+                    if (ok && temp_vi >= target_vi) {
+                        r_found = r_mid;
+                        r_high = r_mid; // 尝试更小的半径
+                    } else {
+                        r_low = r_mid; // 需要更大的半径
+                    }
                 }
+
+                // 如果找到了可行解，记录增量
+                if (r_found > 0.0) {
+                    double delta = r_found - r_orig;
+                    if (delta < min_radius_delta) {
+                        min_radius_delta = delta;
+                        best_new_radius = r_found;
+                        best_sphere_idx = target_idx;
+                    }
+                }
+            }
+
+            // 应用最佳方案
+            if (best_sphere_idx != -1) {
+                double* ptr = spheres->get_tree_point(best_sphere_idx);
+                
+                std::cout << "[Info] Face " << i << ": Expanded sphere " << best_sphere_idx 
+                          << " radius " << ptr[3] << " -> " << best_new_radius 
+                          << " (delta: " << min_radius_delta << ")" << std::endl;
+                
+                ptr[3] = best_new_radius;
+
+                // 重新加载数据并计算最终状态
+                spheres->get_tree_point(i_sphere, 4, sphere_i);
+                spheres->get_tree_point(j_sphere, 4, sphere_j);
+                spheres->get_tree_point(k_sphere, 4, sphere_k);
+                
+                // 再次检查并获取最终的 c_ijk 和 vi
+                if (!check_configuration(sphere_i, sphere_j, sphere_k, current_vi, c_ijk)) {
+                    // 理论上不应发生，因为刚刚验证过
+                    continue; 
+                }
+            } else {
+                // 无法修复 (例如三个球离得太远，扩大两倍都不够)，跳过此面
+                // std::cerr << "[Warning] Failed to fix seed distance for face " << i << std::endl;
+                continue;
             }
         }
 
-        // 4. Check Collinearity via Area
-        if (!failed) {
-            double area = _geom.get_3d_triangle_area(centers);
-            if (area < 1E-10) failed = true;
-        }
+        // === 成功路径：生成并添加种子 ===
+        // 此时 c_ijk 和 current_vi 已经是有效且满足距离要求的
 
-        // --- SUCCESS: GENERATE SEEDS ---
+        // 5. 计算法线方向
+        centers[0] = sphere_i; centers[1] = sphere_j; centers[2] = sphere_k;
         _geom.get_3d_triangle_normal(centers, triplet_normal);
 
+        // 6. 确定方向 (参考网格面法线)
         size_t sphere_i_face;
         spheres->get_tree_point_attrib(i_sphere, 0, sphere_i_face);
+        if (sphere_i_face >= num_faces) sphere_i_face = 0; // Safety
+
         size_t fi_i1 = faces[sphere_i_face][1];
         size_t fi_i2 = faces[sphere_i_face][2];
         size_t fi_i3 = faces[sphere_i_face][3];
         
-        double* fi_corners[3] = { points[fi_i1], points[fi_i2], points[fi_i3] };
-        double fi_normal[3];
+        fi_corners[0] = points[fi_i1];
+        fi_corners[1] = points[fi_i2];
+        fi_corners[2] = points[fi_i3];
         _geom.get_3d_triangle_normal(fi_corners, fi_normal);
 
         double dot = _geom.dot_product(3, fi_normal, triplet_normal);
-        
-        if (dot < 0.0)
-        {
+        if (dot < 0.0) {
             attrib[2] = i_sphere; attrib[3] = k_sphere; attrib[4] = j_sphere;
             for (size_t idim = 0; idim < 3; idim++) triplet_normal[idim] = -triplet_normal[idim];
-        }
-        else
-        {
+        } else {
             attrib[2] = i_sphere; attrib[3] = j_sphere; attrib[4] = k_sphere;
         }
 
-        // Even if vi is very small (close points), we generate both.
-        // Upper and Lower seeds are stored in separate trees, so they won't overwrite each other.
-        for (size_t idim = 0; idim < 3; idim++)
-        {
-            upper_seed[idim] = c_ijk[idim] + vi * triplet_normal[idim];
-            lower_seed[idim] = c_ijk[idim] - vi * triplet_normal[idim];
+        // 7. 计算最终种子坐标
+        // 这里的 current_vi 已经保证 >= 1e-4，或者是初始就足够大
+        if (current_vi < 1e-4) current_vi = 1e-4; // 最后的安全钳制
+
+        for (size_t idim = 0; idim < 3; idim++) {
+            upper_seed[idim] = c_ijk[idim] + current_vi * triplet_normal[idim];
+            lower_seed[idim] = c_ijk[idim] - current_vi * triplet_normal[idim];
         }
 
-        #pragma region Valid Intersection Pairs Storage
-        auto add_current_seed_pair = [&](size_t& upper_seed_index,
-                                         size_t& lower_seed_index,
-                                         bool& upper_added,
-                                         bool& lower_added)
-        {
-            size_t iclosest;
-            double hclosest(DBL_MAX);
-            upper_seed_index = upper_seeds->get_num_tree_points();
-            lower_seed_index = lower_seeds->get_num_tree_points();
-            upper_added = false;
-            lower_added = false;
+        // 8. 写入 MeshingTree
+        double final_radius = fmin(sphere_i[3], fmin(sphere_j[3], sphere_k[3]));
+        upper_seed[3] = final_radius;
+        lower_seed[3] = final_radius;
 
-            // Keep duplicate suppression for stability with neighboring faces.
-            lower_seeds->get_closest_tree_point(lower_seed, iclosest, hclosest);
-            if (hclosest < 1E-10) lower_seed_index = iclosest;
+        size_t upper_idx = upper_seeds->get_num_tree_points();
+        size_t lower_idx = lower_seeds->get_num_tree_points();
+        size_t iclosest; double hclosest = DBL_MAX;
 
-            hclosest = DBL_MAX;
-            upper_seeds->get_closest_tree_point(upper_seed, iclosest, hclosest);
-            if (hclosest < 1E-10) upper_seed_index = iclosest;
+        lower_seeds->get_closest_tree_point(lower_seed, iclosest, hclosest);
+        if (hclosest < 1E-10) lower_idx = iclosest;
 
-            if (lower_seed_index == lower_seeds->get_num_tree_points())
-            {
-                lower_seed[3] = fmin(sphere_i[3], fmin(sphere_j[3], sphere_k[3]));
-                attrib[1] = upper_seed_index;
-                lower_seeds->add_tree_point(4, lower_seed, triplet_normal, attrib.data());
-                lower_added = true;
-            }
+        hclosest = DBL_MAX;
+        upper_seeds->get_closest_tree_point(upper_seed, iclosest, hclosest);
+        if (hclosest < 1E-10) upper_idx = iclosest;
 
-            if (upper_seed_index == upper_seeds->get_num_tree_points())
-            {
-                upper_seed[3] = fmin(sphere_i[3], fmin(sphere_j[3], sphere_k[3]));
-                attrib[1] = lower_seed_index;
-                upper_seeds->add_tree_point(4, upper_seed, triplet_normal, attrib.data());
-                upper_added = true;
-            }
-        };
-
-        // First add the currently computed seed pair.
-        size_t upper_seed_index = 0, lower_seed_index = 0;
-        bool upper_added = false, lower_added = false;
-        add_current_seed_pair(upper_seed_index, lower_seed_index, upper_added, lower_added);
-
-        // If the pair is too close, delete old seeds, enlarge radius, recompute, then add new seeds.
-        double seed_pair_distance = _geom.distance(3, upper_seed, lower_seed);
-        if (seed_pair_distance < 1e-4)
-        {
-            double original_upper_seed[4] = {upper_seed[0], upper_seed[1], upper_seed[2], upper_seed[3]};
-            double original_lower_seed[4] = {lower_seed[0], lower_seed[1], lower_seed[2], lower_seed[3]};
-            double original_triplet_normal[3] = {triplet_normal[0], triplet_normal[1], triplet_normal[2]};
-            size_t original_attr2 = attrib[2], original_attr3 = attrib[3], original_attr4 = attrib[4];
-
-            if (lower_added) lower_seeds->lazy_delete_tree_point(lower_seed_index);
-            if (upper_added) upper_seeds->lazy_delete_tree_point(upper_seed_index);
-
-            double* sphere_i_ptr = spheres->get_tree_point((size_t)i_sphere);
-            double original_radius = sphere_i_ptr[3];
-            const int max_expand_iters = 20;
-            const double expand_factor = 1.05;
-            bool fixed_pair = false;
-
-            for (int expand_iter = 0; expand_iter < max_expand_iters; expand_iter++)
-            {
-                sphere_i_ptr[3] *= expand_factor;
-
-                bool recompute_failed = false;
-                spheres->get_tree_point(i_sphere, 4, sphere_i);
-                spheres->get_tree_point(j_sphere, 4, sphere_j);
-                spheres->get_tree_point(k_sphere, 4, sphere_k);
-
-                double dst_ij = _geom.distance(3, sphere_i, sphere_j);
-                if (dst_ij > sphere_i[3] + sphere_j[3] + 1E-10) recompute_failed = true;
-
-                if (!recompute_failed)
-                {
-                    double dst_ik = _geom.distance(3, sphere_i, sphere_k);
-                    if (dst_ik > sphere_i[3] + sphere_k[3] + 1E-10) recompute_failed = true;
-                }
-
-                if (!recompute_failed)
-                {
-                    double dst_jk = _geom.distance(3, sphere_j, sphere_k);
-                    if (dst_jk > sphere_j[3] + sphere_k[3] + 1E-10) recompute_failed = true;
-                }
-
-                double vi_new = 0.0;
-                if (!recompute_failed)
-                {
-                    centers[0] = sphere_i; centers[1] = sphere_j; centers[2] = sphere_k;
-                    radii[0] = sphere_i[3]; radii[1] = sphere_j[3]; radii[2] = sphere_k[3];
-
-                    bool pv_valid = _geom.get_power_vertex(3, 3, centers, radii, c_ijk);
-                    if (!pv_valid)
-                    {
-                        recompute_failed = true;
-                    }
-                    else
-                    {
-                        double hi = _geom.distance(3, c_ijk, sphere_i);
-                        if (hi > sphere_i[3] - 1e-10)
-                        {
-                            recompute_failed = true;
-                        }
-                        else
-                        {
-                            vi_new = sqrt(fmax(0.0, sphere_i[3] * sphere_i[3] - hi * hi));
-                            if (vi_new < 1e-4) vi_new = 1e-4;
-                        }
-                    }
-                }
-
-                if (!recompute_failed)
-                {
-                    double area = _geom.get_3d_triangle_area(centers);
-                    if (area < 1E-10) recompute_failed = true;
-                }
-
-                if (recompute_failed) continue;
-                if (!_geom.get_3d_triangle_normal(centers, triplet_normal)) continue;
-
-                size_t sphere_i_face;
-                if (!spheres->get_tree_point_attrib(i_sphere, 0, sphere_i_face)) continue;
-                if (sphere_i_face >= num_faces) continue;
-
-                size_t fi_i1 = faces[sphere_i_face][1];
-                size_t fi_i2 = faces[sphere_i_face][2];
-                size_t fi_i3 = faces[sphere_i_face][3];
-                double* fi_corners[3] = { points[fi_i1], points[fi_i2], points[fi_i3] };
-                double fi_normal[3];
-                if (!_geom.get_3d_triangle_normal(fi_corners, fi_normal)) continue;
-
-                double dot = _geom.dot_product(3, fi_normal, triplet_normal);
-                if (dot < 0.0)
-                {
-                    attrib[2] = i_sphere; attrib[3] = k_sphere; attrib[4] = j_sphere;
-                    for (size_t idim = 0; idim < 3; idim++) triplet_normal[idim] = -triplet_normal[idim];
-                }
-                else
-                {
-                    attrib[2] = i_sphere; attrib[3] = j_sphere; attrib[4] = k_sphere;
-                }
-
-                for (size_t idim = 0; idim < 3; idim++)
-                {
-                    upper_seed[idim] = c_ijk[idim] + vi_new * triplet_normal[idim];
-                    lower_seed[idim] = c_ijk[idim] - vi_new * triplet_normal[idim];
-                }
-
-                seed_pair_distance = _geom.distance(3, upper_seed, lower_seed);
-                if (seed_pair_distance >= 1e-4)
-                {
-                    fixed_pair = true;
-                    break;
-                }
-            }
-
-            if (!fixed_pair)
-            {
-                sphere_i_ptr[3] = original_radius;
-
-                for (size_t idim = 0; idim < 4; idim++) {
-                    upper_seed[idim] = original_upper_seed[idim];
-                    lower_seed[idim] = original_lower_seed[idim];
-                }
-                for (size_t idim = 0; idim < 3; idim++) {
-                    triplet_normal[idim] = original_triplet_normal[idim];
-                }
-                attrib[2] = original_attr2;
-                attrib[3] = original_attr3;
-                attrib[4] = original_attr4;
-
-                add_current_seed_pair(upper_seed_index, lower_seed_index, upper_added, lower_added);
-                std::cerr << "[Warning] Face " << i
-                          << " seed pair distance still < 1e-4 after radius expansion." << std::endl;
-                continue;
-            }
-
-            // Add recomputed replacement seeds.
-            add_current_seed_pair(upper_seed_index, lower_seed_index, upper_added, lower_added);
+        if (lower_idx == lower_seeds->get_num_tree_points()) {
+            attrib[1] = upper_idx;
+            lower_seeds->add_tree_point(4, lower_seed, triplet_normal, attrib.data());
         }
-        #pragma endregion
+
+        if (upper_idx == upper_seeds->get_num_tree_points()) {
+            attrib[1] = lower_idx;
+            upper_seeds->add_tree_point(4, upper_seed, triplet_normal, attrib.data());
+        }
     }
 
+    // Cleanup
     delete[] sphere_i; delete[] sphere_j; delete[] sphere_k;
     delete[] c_ijk; delete[] centers; delete[] radii;
     delete[] triplet_normal; delete[] upper_seed; delete[] lower_seed;
-
+    delete[] temp_c_ijk;
 }
 
 void Generator::generate_surface_seeds(size_t num_points, double **points, size_t num_faces, size_t **faces,
@@ -615,7 +540,6 @@ void Generator::generate_surface_seeds(size_t num_points, double **points, size_
                 if (hi > sphere_i[3] - 1E-10) continue;
 
                 double vi = sqrt(sphere_i[3] * sphere_i[3] - hi * hi);
-                if (vi < 1e-4) vi = 1e-4;
 
                 // Three overlapping spheres with an intersection pair
                 double area = _geom.get_3d_triangle_area(centers);

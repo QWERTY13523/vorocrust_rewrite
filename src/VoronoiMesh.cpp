@@ -187,136 +187,143 @@ void optimizer(MeshingTree* seeds, MeshingTree* spheres, std::vector<int> face_f
             size_t* attrib_i = seeds->get_tree_point_attrib(seed_i);
             size_t sph_ids[3] = {attrib_i[2], attrib_i[3], attrib_i[4]};
 
-            // ---- Choose sphere with fewest faces (least impact) ----
-            int    best_k   = -1;
+            // ---- Try all 3 spheres on this face, pick the best shrink ----
             size_t best_sid = SIZE_MAX;
-            size_t min_fc   = SIZE_MAX;
-            for (int k = 0; k < 3; k++) {
-                size_t sid = sph_ids[k];
+            double best_valid_r = 0.0;
+            double best_orig_r = 0.0;
+            double best_shrink_ratio = 0.0;  // (orig - valid) / orig
+            std::vector<size_t> best_seeds_to_delete;
+
+            for (int try_k = 0; try_k < 3; try_k++) {
+                size_t sid = sph_ids[try_k];
                 if (sid >= num_spheres) continue;
                 if (processed_spheres.count(sid)) continue;
-                size_t fc = sphere_to_faces[sid].size();
-                if (fc < min_fc) { min_fc = fc; best_k = k; best_sid = sid; }
+
+                double* sph_data = spheres->get_tree_point(sid);
+                double  orig_r   = sph_data[3];
+
+                // ---- Compute minimum viable radius for this sphere ----
+                double r_min = 0.0;
+                for (size_t fi : sphere_to_faces[sid]) {
+                    for (int k = 0; k < 3; k++) {
+                        size_t other = (size_t)face_flat[fi * 3 + k];
+                        if (other == sid) continue;
+                        double other_sp[4];
+                        spheres->get_tree_point(other, 4, other_sp);
+                        double d   = geom.distance(3, sph_data, other_sp);
+                        double req = d - other_sp[3] + 1e-6;
+                        if (req > r_min) r_min = req;
+                    }
+                }
+                if (r_min <= 0.0) r_min = 1e-6;
+                if (r_min >= orig_r - 1e-10) continue;  // cannot shrink this sphere
+
+                // ---- Collect old seeds from all affected faces of this sphere ----
+                std::set<std::tuple<size_t,size_t,size_t>> affected_keys;
+                for (size_t fi : sphere_to_faces[sid]) {
+                    affected_keys.insert(make_face_key(
+                        (size_t)face_flat[fi*3],
+                        (size_t)face_flat[fi*3+1],
+                        (size_t)face_flat[fi*3+2]));
+                }
+
+                std::vector<size_t> seeds_to_del;
+                for (auto& fk : affected_keys) {
+                    auto it = face_key_to_seeds.find(fk);
+                    if (it == face_key_to_seeds.end()) continue;
+                    for (size_t s : it->second) {
+                        if (seeds->tree_point_is_active(s))
+                            seeds_to_del.push_back(s);
+                    }
+                }
+
+                // ---- Binary search for smallest valid radius ----
+                double lo   = r_min;
+                double hi_r = orig_r;
+                double valid_r = orig_r;
+                bool   found   = false;
+
+                for (int bs = 0; bs < 40; bs++) {
+                    double mid = (lo + hi_r) / 2.0;
+                    sph_data[3] = mid;
+
+                    bool all_ok = true;
+
+                    // -- C1: face validity --
+                    for (size_t fi : sphere_to_faces[sid]) {
+                        double sa[4], sb[4], nm[3];
+                        if (!compute_face_seeds(
+                                (size_t)face_flat[fi*3],
+                                (size_t)face_flat[fi*3+1],
+                                (size_t)face_flat[fi*3+2],
+                                sa, sb, nm)) {
+                            all_ok = false;
+                            break;
+                        }
+                    }
+
+                    // -- C2: distance check --
+                    if (all_ok) {
+                        for (size_t fi : sphere_to_faces[sid]) {
+                            double sa[4], sb[4], nm[3];
+                            compute_face_seeds(
+                                (size_t)face_flat[fi*3],
+                                (size_t)face_flat[fi*3+1],
+                                (size_t)face_flat[fi*3+2],
+                                sa, sb, nm);
+
+                            if (geom.distance(3, sa, sb) <= 1e-4) { all_ok = false; break; }
+
+                            size_t ic; double hc = DBL_MAX;
+                            seeds->get_closest_tree_point(
+                                sa, seeds_to_del.size(),
+                                seeds_to_del.data(), ic, hc);
+                            if (hc < 1e-3) { all_ok = false; break; }
+
+                            hc = DBL_MAX;
+                            seeds->get_closest_tree_point(
+                                sb, seeds_to_del.size(),
+                                seeds_to_del.data(), ic, hc);
+                            if (hc < 1e-3) { all_ok = false; break; }
+                        }
+                    }
+
+                    if (all_ok) {
+                        valid_r = mid;
+                        found   = true;
+                        hi_r    = mid;
+                    } else {
+                        lo = mid;
+                    }
+                }
+
+                sph_data[3] = orig_r;  // restore
+
+                if (!found) continue;
+
+                // ---- Compare with current best ----
+                double shrink_ratio = (orig_r - valid_r) / orig_r;
+                if (best_sid == SIZE_MAX || shrink_ratio > best_shrink_ratio) {
+                    best_sid = sid;
+                    best_valid_r = valid_r;
+                    best_orig_r = orig_r;
+                    best_shrink_ratio = shrink_ratio;
+                    best_seeds_to_delete = std::move(seeds_to_del);
+                }
             }
-            if (best_k < 0) continue;
+
+            if (best_sid == SIZE_MAX) continue;  // no sphere could be shrunk
             processed_spheres.insert(best_sid);
 
+            // ---- Apply the best shrink ----
             double* sph_data = spheres->get_tree_point(best_sid);
-            double  orig_r   = sph_data[3];
-
-            // ---- Compute minimum viable radius ----
-            // For every face containing this sphere, the sphere must still
-            // overlap with the other two spheres (dist < r_new + r_other).
-            // => r_new > dist - r_other   (plus small margin)
-            double r_min = 0.0;
-            for (size_t fi : sphere_to_faces[best_sid]) {
-                for (int k = 0; k < 3; k++) {
-                    size_t other = (size_t)face_flat[fi * 3 + k];
-                    if (other == best_sid) continue;
-                    double other_sp[4];
-                    spheres->get_tree_point(other, 4, other_sp);
-                    double d   = geom.distance(3, sph_data, other_sp);
-                    double req = d - other_sp[3] + 1e-6;
-                    if (req > r_min) r_min = req;
-                }
-            }
-            if (r_min <= 0.0) r_min = 1e-6;
-            if (r_min >= orig_r - 1e-10) continue;  // cannot shrink
-
-            // ---- Collect old seeds from all affected faces ----
-            std::set<std::tuple<size_t,size_t,size_t>> affected_keys;
-            for (size_t fi : sphere_to_faces[best_sid]) {
-                affected_keys.insert(make_face_key(
-                    (size_t)face_flat[fi*3],
-                    (size_t)face_flat[fi*3+1],
-                    (size_t)face_flat[fi*3+2]));
-            }
-
-            std::vector<size_t> seeds_to_delete;
-            for (auto& fk : affected_keys) {
-                auto it = face_key_to_seeds.find(fk);
-                if (it == face_key_to_seeds.end()) continue;
-                for (size_t s : it->second) {
-                    if (seeds->tree_point_is_active(s))
-                        seeds_to_delete.push_back(s);
-                }
-            }
-
-            // ---- Binary search for smallest valid radius ----
-            // Constraints checked:
-            //   C1. Every affected face still produces valid seeds
-            //       (pairwise overlap, power vertex inside all 3 spheres).
-            //   C2. New seed positions > 1e-3 from all non-deleted active seeds.
-            double lo   = r_min;
-            double hi_r = orig_r;
-            double valid_r = orig_r;
-            bool   found   = false;
-
-            for (int bs = 0; bs < 40; bs++) {
-                double mid = (lo + hi_r) / 2.0;
-                sph_data[3] = mid;
-
-                bool all_ok = true;
-
-                // -- C1: face validity --
-                for (size_t fi : sphere_to_faces[best_sid]) {
-                    double sa[4], sb[4], nm[3];
-                    if (!compute_face_seeds(
-                            (size_t)face_flat[fi*3],
-                            (size_t)face_flat[fi*3+1],
-                            (size_t)face_flat[fi*3+2],
-                            sa, sb, nm)) {
-                        all_ok = false;
-                        break;
-                    }
-                }
-
-                // -- C2: distance check --
-                if (all_ok) {
-                    for (size_t fi : sphere_to_faces[best_sid]) {
-                        double sa[4], sb[4], nm[3];
-                        compute_face_seeds(
-                            (size_t)face_flat[fi*3],
-                            (size_t)face_flat[fi*3+1],
-                            (size_t)face_flat[fi*3+2],
-                            sa, sb, nm);
-
-                        // Constraint: distance between new seed pair > 1e-4
-                        if (geom.distance(3, sa, sb) <= 1e-4) { all_ok = false; break; }
-
-                        size_t ic; double hc = DBL_MAX;
-                        seeds->get_closest_tree_point(
-                            sa, seeds_to_delete.size(),
-                            seeds_to_delete.data(), ic, hc);
-                        if (hc < 1e-3) { all_ok = false; break; }
-
-                        hc = DBL_MAX;
-                        seeds->get_closest_tree_point(
-                            sb, seeds_to_delete.size(),
-                            seeds_to_delete.data(), ic, hc);
-                        if (hc < 1e-3) { all_ok = false; break; }
-                    }
-                }
-
-                if (all_ok) {
-                    valid_r = mid;
-                    found   = true;
-                    hi_r    = mid;   // try even smaller
-                } else {
-                    lo = mid;        // too small, increase
-                }
-            }
-
-            sph_data[3] = orig_r;  // restore temporarily
-            if (!found) continue;
-
-            // ---- Apply the shrink ----
-            sph_data[3] = valid_r;
+            sph_data[3] = best_valid_r;
             std::cout << "    Sphere " << best_sid
-                      << ": radius " << orig_r << " -> " << valid_r << std::endl;
+                      << ": radius " << best_orig_r << " -> " << best_valid_r
+                      << " (shrink " << (best_shrink_ratio * 100.0) << "%)" << std::endl;
 
             // ---- Delete old seeds from affected faces ----
-            for (size_t s : seeds_to_delete) {
+            for (size_t s : best_seeds_to_delete) {
                 seeds->lazy_delete_tree_point(s);
             }
 
@@ -395,119 +402,8 @@ void Generator::generate_surface_mesh(MeshingTree* seeds, MeshingTree* spheres, 
         }
     };
 
-    // auto calc_bbox_diag = [&]() {
-    //     double min_x = std::numeric_limits<double>::max();
-    //     double min_y = std::numeric_limits<double>::max();
-    //     double min_z = std::numeric_limits<double>::max();
-    //     double max_x = -std::numeric_limits<double>::max();
-    //     double max_y = -std::numeric_limits<double>::max();
-    //     double max_z = -std::numeric_limits<double>::max();
-    //     bool has_active_seed = false;
-
-    //     for (size_t i = 0; i < num_seeds; i++) {
-    //         if (!seeds->tree_point_is_active(i)) continue;
-    //         double* pt = seeds->get_tree_point(i);
-    //         min_x = std::min(min_x, pt[0]);
-    //         min_y = std::min(min_y, pt[1]);
-    //         min_z = std::min(min_z, pt[2]);
-    //         max_x = std::max(max_x, pt[0]);
-    //         max_y = std::max(max_y, pt[1]);
-    //         max_z = std::max(max_z, pt[2]);
-    //         has_active_seed = true;
-    //     }
-
-    //     if (!has_active_seed) return 1.0;
-    //     double dx = max_x - min_x;
-    //     double dy = max_y - min_y;
-    //     double dz = max_z - min_z;
-    //     return std::sqrt(dx * dx + dy * dy + dz * dz);
-    // };
-
-    // // Enforce adjacency for paired seeds by shrinking non-adjacent pair distance iteratively.
-    // const int max_pair_adjust_iters = 20;
-    // const double bbox_diag = calc_bbox_diag();
-    // const double move_step_start = std::max(6e-4, bbox_diag * 6e-4);
-    // const double move_step_end = std::max(2e-4, bbox_diag * 2e-4);
-    // size_t last_non_adjacent_count = 0;
-
-    // for (int iter = 0; iter < max_pair_adjust_iters; ++iter) {
-    //     build_delaunay();
-
-    //     // Learning-rate style schedule: larger step early, smaller step later.
-    //     double t = (max_pair_adjust_iters > 1)
-    //         ? static_cast<double>(iter) / static_cast<double>(max_pair_adjust_iters - 1)
-    //         : 1.0;
-    //     double move_step = move_step_start + (move_step_end - move_step_start) * t;
-
-    //     std::set<std::pair<size_t, size_t>> delaunay_edges;
-    //     for (auto eit = dt.finite_edges_begin(); eit != dt.finite_edges_end(); ++eit) {
-    //         Cell_handle c = eit->first;
-    //         int i1 = eit->second;
-    //         int i2 = eit->third;
-    //         Vertex_handle v1 = c->vertex(i1);
-    //         Vertex_handle v2 = c->vertex(i2);
-    //         if (dt.is_infinite(v1) || dt.is_infinite(v2)) continue;
-
-    //         size_t s1 = v1->info();
-    //         size_t s2 = v2->info();
-    //         if (s1 >= num_seeds || s2 >= num_seeds || s1 == s2) continue;
-    //         delaunay_edges.insert(pair_key(s1, s2));
-    //     }
-
-    //     std::vector<std::pair<size_t, size_t>> non_adjacent_pairs;
-    //     for (size_t i = 0; i < num_seeds; i++) {
-    //         if (!seeds->tree_point_is_active(i)) continue;
-    //         size_t* attrib = seeds->get_tree_point_attrib(i);
-    //         size_t j = attrib[1];
-    //         if (j <= i || j >= num_seeds) continue;
-    //         if (!seeds->tree_point_is_active(j)) continue;
-    //         size_t* pair_attrib = seeds->get_tree_point_attrib(j);
-    //         if (pair_attrib[1] != i) continue;
-
-    //         if (delaunay_edges.find(pair_key(i, j)) == delaunay_edges.end()) {
-    //             non_adjacent_pairs.emplace_back(i, j);
-    //         }
-    //     }
-
-    //     std::cout << "iter : " << iter << " " << last_non_adjacent_count << "\n";
-    //     last_non_adjacent_count = non_adjacent_pairs.size();
-    //     if (last_non_adjacent_count == 0) {
-    //         if (iter > 0) {
-    //             std::cout << "  * Seed-pair adjacency converged after " << iter
-    //                       << " iterations" << std::endl;
-    //         }
-    //         break;
-    //     }
-
-    //     for (const auto& pr : non_adjacent_pairs) {
-    //         double* p1 = seeds->get_tree_point(pr.first);
-    //         double* p2 = seeds->get_tree_point(pr.second);
-
-    //         double dx = p2[0] - p1[0];
-    //         double dy = p2[1] - p1[1];
-    //         double dz = p2[2] - p1[2];
-    //         double dist = std::sqrt(dx * dx + dy * dy + dz * dz);
-    //         if (dist < 1e-12) continue;
-
-    //         double move_len = std::min(move_step, 0.45 * dist);
-    //         if (move_len <= 0.0) continue;
-
-    //         double inv_dist = 1.0 / dist;
-    //         p1[0] += dx * inv_dist * move_len;
-    //         p1[1] += dy * inv_dist * move_len;
-    //         p1[2] += dz * inv_dist * move_len;
-    //         p2[0] -= dx * inv_dist * move_len;
-    //         p2[1] -= dy * inv_dist * move_len;
-    //         p2[2] -= dz * inv_dist * move_len;
-    //     }
-    // }
-
     // Rebuild once to ensure dt/vertex_handles match final adjusted seed positions.
     build_delaunay();
-    // if (last_non_adjacent_count > 0) {
-    //     std::cout << "  * Warning: still " << last_non_adjacent_count
-    //               << " non-adjacent seed pairs after max iterations" << std::endl;
-    // }
 
     std::cout << "  * Delaunay triangulation built with " << dt.number_of_vertices() << " vertices" << std::endl;
 
@@ -662,48 +558,48 @@ void Generator::generate_surface_mesh(MeshingTree* seeds, MeshingTree* spheres, 
     }
 
     {
-    std::cout << "  * Exporting seed pair connections to seed_pairs.obj ..." << std::endl;
-    
-    std::ofstream pairs_out("seed_pairs.obj");
-    if (pairs_out.is_open()) {
-        pairs_out << std::fixed << std::setprecision(16);
-        pairs_out << "# Seed Pair Connections\n";
+        std::cout << "  * Exporting seed pair connections to seed_pairs.obj ..." << std::endl;
         
-        // 棣栧厛杈撳嚭鎵€鏈夌瀛愮偣浣滀负椤剁偣
-        for (size_t i = 0; i < num_seeds; i++) {
-            if (!seeds->tree_point_is_active(i)) continue;
-            double* pt = seeds->get_tree_point(i);
-            pairs_out << "v " << pt[0] << " " << pt[1] << " " << pt[2] << "\n";
-        }
-        
-        // 鐒跺悗杈撳嚭閰嶅杩炴帴绾?
-        size_t pair_count = 0;
-        std::set<std::pair<size_t, size_t>> processed_pairs;
-        
-        for (size_t i = 0; i < num_seeds; i++) {
-            if (!seeds->tree_point_is_active(i)) continue;
+        std::ofstream pairs_out("seed_pairs.obj");
+        if (pairs_out.is_open()) {
+            pairs_out << std::fixed << std::setprecision(16);
+            pairs_out << "# Seed Pair Connections\n";
             
-            size_t* attrib = seeds->get_tree_point_attrib(i);
-            size_t pair_idx = attrib[1]; // attrib[1] 鏄厤瀵圭瀛愮储寮?
+            // 棣栧厛杈撳嚭鎵€鏈夌瀛愮偣浣滀负椤剁偣
+            for (size_t i = 0; i < num_seeds; i++) {
+                if (!seeds->tree_point_is_active(i)) continue;
+                double* pt = seeds->get_tree_point(i);
+                pairs_out << "v " << pt[0] << " " << pt[1] << " " << pt[2] << "\n";
+            }
             
-            if (pair_idx < num_seeds && seeds->tree_point_is_active(pair_idx)) {
-                // 閬垮厤閲嶅杈撳嚭鍚屼竴瀵?
-                auto pair_key = std::minmax(i, pair_idx);
-                if (processed_pairs.find(pair_key) == processed_pairs.end()) {
-                    // OBJ浣跨敤1-based绱㈠紩
-                    pairs_out << "l " << (i + 1) << " " << (pair_idx + 1) << "\n";
-                    processed_pairs.insert(pair_key);
-                    pair_count++;
+            // 鐒跺悗杈撳嚭閰嶅杩炴帴绾?
+            size_t pair_count = 0;
+            std::set<std::pair<size_t, size_t>> processed_pairs;
+            
+            for (size_t i = 0; i < num_seeds; i++) {
+                if (!seeds->tree_point_is_active(i)) continue;
+                
+                size_t* attrib = seeds->get_tree_point_attrib(i);
+                size_t pair_idx = attrib[1]; // attrib[1] 鏄厤瀵圭瀛愮储寮?
+                
+                if (pair_idx < num_seeds && seeds->tree_point_is_active(pair_idx)) {
+                    // 閬垮厤閲嶅杈撳嚭鍚屼竴瀵?
+                    auto pair_key = std::minmax(i, pair_idx);
+                    if (processed_pairs.find(pair_key) == processed_pairs.end()) {
+                        // OBJ浣跨敤1-based绱㈠紩
+                        pairs_out << "l " << (i + 1) << " " << (pair_idx + 1) << "\n";
+                        processed_pairs.insert(pair_key);
+                        pair_count++;
+                    }
                 }
             }
+            
+            pairs_out.close();
+            std::cout << "  * Seed pairs: " << pair_count << " connections (saved to seed_pairs.obj)" << std::endl;
+        } else {
+            std::cerr << "Error: Cannot write to seed_pairs.obj" << std::endl;
         }
-        
-        pairs_out.close();
-        std::cout << "  * Seed pairs: " << pair_count << " connections (saved to seed_pairs.obj)" << std::endl;
-    } else {
-        std::cerr << "Error: Cannot write to seed_pairs.obj" << std::endl;
     }
-}
     // 2. Collect Voronoi facets for inside/outside seed pairs
     std::vector<std::vector<Point_3>> voronoi_facets;
     
@@ -725,7 +621,7 @@ void Generator::generate_surface_mesh(MeshingTree* seeds, MeshingTree* spheres, 
         // attrib[1] is the pair seed index
         // 杩欓噷浣跨敤涔嬪墠鐢熸垚鐨勯厤瀵逛俊鎭紝鎴栬€呭彲浠ユ敼鐢ㄥ尯鍩?ID (attrib[5]) 鍒ゆ柇: 
         //bool is_interface = (attrib1[5] != attrib2[5]);
-        bool is_interface = (attrib1[5] != attrib2[5]) && attrib1[1] == seed_idx2 && attrib2[1] == seed_idx1;
+        bool is_interface = (attrib1[5] != attrib2[5]) && (attrib1[1] == seed_idx2 || attrib2[1] == seed_idx1);
         if (!is_interface) continue;
       //  if (!is_pair) continue;
         int label1 = seed_idx1;
@@ -742,9 +638,6 @@ void Generator::generate_surface_mesh(MeshingTree* seeds, MeshingTree* spheres, 
         
         do {
             if (!dt.is_infinite(cc)) {
-                // Compute circumcenter manually or use CGAL dual
-                // Using dual() is safer and usually cached/optimized in some kernels, 
-                // but manual construction as you did is also fine for Exact kernel.
                 Point_3 center = dt.dual(cc); 
                 facet_vertices.push_back(center);
             }
