@@ -14,6 +14,345 @@ Generator::Generator()
 
 Generator::~Generator()
 {
+
+}
+
+// =========================================================
+//  Helper Structures for BVH & Ray-Triangle Intersection
+// =========================================================
+
+namespace {
+
+    struct AABB {
+        double min[3];
+        double max[3];
+
+        AABB() {
+            min[0] = min[1] = min[2] = DBL_MAX;
+            max[0] = max[1] = max[2] = -DBL_MAX;
+        }
+
+        void expand(double* p) {
+            for (int i = 0; i < 3; i++) {
+                if (p[i] < min[i]) min[i] = p[i];
+                if (p[i] > max[i]) max[i] = p[i];
+            }
+        }
+
+        bool intersect(const double* ray_origin, const double* ray_dir, double t_max) const {
+            double tmin = 0.0, tmax = t_max;
+            for (int i = 0; i < 3; i++) {
+                if (fabs(ray_dir[i]) < 1e-12) {
+                    if (ray_origin[i] < min[i] || ray_origin[i] > max[i]) return false;
+                } else {
+                    double ood = 1.0 / ray_dir[i];
+                    double t1 = (min[i] - ray_origin[i]) * ood;
+                    double t2 = (max[i] - ray_origin[i]) * ood;
+                    if (t1 > t2) std::swap(t1, t2);
+                    if (t1 > tmin) tmin = t1;
+                    if (t2 < tmax) tmax = t2;
+                    if (tmin > tmax) return false;
+                }
+            }
+            return true;
+        }
+    };
+
+    struct BVHNode {
+        AABB box;
+        int left = -1;
+        int right = -1;
+        std::vector<int> face_indices; // Only leaf nodes have faces
+    };
+
+    // Möller–Trumbore intersection algorithm
+    bool ray_triangle_intersect(
+        const double* orig, const double* dir, double max_dist,
+        const double* v0, const double* v1, const double* v2,
+        double& t, double& u, double& v) 
+    {
+        double v0v1[3], v0v2[3], pvec[3], tvec[3], qvec[3];
+        for(int i=0; i<3; i++) {
+            v0v1[i] = v1[i] - v0[i];
+            v0v2[i] = v2[i] - v0[i];
+        }
+
+        // pvec = dir X v0v2
+        pvec[0] = dir[1]*v0v2[2] - dir[2]*v0v2[1];
+        pvec[1] = dir[2]*v0v2[0] - dir[0]*v0v2[2];
+        pvec[2] = dir[0]*v0v2[1] - dir[1]*v0v2[0];
+
+        double det = 0.0;
+        for(int i=0; i<3; i++) det += v0v1[i] * pvec[i];
+
+        if (fabs(det) < 1e-8) return false;
+        double invDet = 1.0 / det;
+
+        for(int i=0; i<3; i++) tvec[i] = orig[i] - v0[i];
+        
+        // u = (tvec . pvec) * invDet
+        double dot_tu = 0.0;
+        for(int i=0; i<3; i++) dot_tu += tvec[i] * pvec[i];
+        u = dot_tu * invDet;
+        if (u < 0.0 || u > 1.0) return false;
+
+        // qvec = tvec X v0v1
+        qvec[0] = tvec[1]*v0v1[2] - tvec[2]*v0v1[1];
+        qvec[1] = tvec[2]*v0v1[0] - tvec[0]*v0v1[2];
+        qvec[2] = tvec[0]*v0v1[1] - tvec[1]*v0v1[0];
+
+        // v = (dir . qvec) * invDet
+        double dot_dv = 0.0;
+        for(int i=0; i<3; i++) dot_dv += dir[i] * qvec[i];
+        v = dot_dv * invDet;
+        if (v < 0.0 || u + v > 1.0) return false;
+
+        // t = (v0v2 . qvec) * invDet
+        double dot_t = 0.0;
+        for(int i=0; i<3; i++) dot_t += v0v2[i] * qvec[i];
+        t = dot_t * invDet;
+
+        return (t > 1e-8 && t <= max_dist); // Intersection must be within segment length
+    }
+
+    class SimpleBVH {
+    public:
+        std::vector<BVHNode> nodes;
+        double** points_ref;
+        size_t** faces_ref;
+
+        void build(double** points, size_t num_faces, size_t** faces) {
+            points_ref = points;
+            faces_ref = faces;
+            nodes.reserve(num_faces * 2);
+            
+            std::vector<int> all_faces(num_faces);
+            for(int i=0; i<num_faces; ++i) all_faces[i] = i;
+
+            build_recursive(all_faces);
+        }
+
+        int count_intersections(const double* p1, const double* p2) {
+            double dir[3];
+            double dist = 0.0;
+            for(int i=0; i<3; i++) {
+                dir[i] = p2[i] - p1[i];
+                dist += dir[i]*dir[i];
+            }
+            dist = sqrt(dist);
+            if(dist < 1e-12) return 0;
+            for(int i=0; i<3; i++) dir[i] /= dist;
+
+            return intersect_recursive(0, p1, dir, dist);
+        }
+
+    private:
+        int build_recursive(std::vector<int>& face_indices) {
+            BVHNode node;
+            for (int fid : face_indices) {
+                size_t* f = faces_ref[fid];
+                node.box.expand(points_ref[f[1]]);
+                node.box.expand(points_ref[f[2]]);
+                node.box.expand(points_ref[f[3]]);
+            }
+
+            if (face_indices.size() <= 8) { // Leaf node threshold
+                node.face_indices = face_indices;
+                nodes.push_back(node);
+                return (int)nodes.size() - 1;
+            }
+
+            double size[3] = {
+                node.box.max[0] - node.box.min[0],
+                node.box.max[1] - node.box.min[1],
+                node.box.max[2] - node.box.min[2]
+            };
+            int axis = 0;
+            if (size[1] > size[0]) axis = 1;
+            if (size[2] > size[axis]) axis = 2;
+            double mid = (node.box.min[axis] + node.box.max[axis]) * 0.5;
+
+            std::vector<int> left_faces, right_faces;
+            for (int fid : face_indices) {
+                size_t* f = faces_ref[fid];
+                double centroid = (points_ref[f[1]][axis] + points_ref[f[2]][axis] + points_ref[f[3]][axis]) / 3.0;
+                if (centroid < mid) left_faces.push_back(fid);
+                else right_faces.push_back(fid);
+            }
+
+            if (left_faces.empty() || right_faces.empty()) {
+                 node.face_indices = face_indices;
+                 nodes.push_back(node);
+                 return (int)nodes.size() - 1;
+            }
+
+            int curr_idx = (int)nodes.size();
+            nodes.push_back(node); 
+            
+            int l_idx = build_recursive(left_faces);
+            int r_idx = build_recursive(right_faces);
+
+            nodes[curr_idx].left = l_idx;
+            nodes[curr_idx].right = r_idx;
+            return curr_idx;
+        }
+
+        int intersect_recursive(int node_idx, const double* orig, const double* dir, double max_dist) {
+            const BVHNode& node = nodes[node_idx];
+            if (!node.box.intersect(orig, dir, max_dist)) return 0;
+
+            int hits = 0;
+            if (node.left == -1) { // Leaf
+                for (int fid : node.face_indices) {
+                    size_t* f = faces_ref[fid];
+                    double t, u, v;
+                    if (ray_triangle_intersect(orig, dir, max_dist, 
+                        points_ref[f[1]], points_ref[f[2]], points_ref[f[3]], t, u, v)) {
+                        hits++;
+                    }
+                }
+            } else {
+                hits += intersect_recursive(node.left, orig, dir, max_dist);
+                hits += intersect_recursive(node.right, orig, dir, max_dist);
+            }
+            return hits;
+        }
+    };
+}
+
+// =========================================================
+//  Function Implementation
+// =========================================================
+
+void Generator::check_seed_pairs_sidedness(
+    MeshingTree* upper_seeds, 
+    MeshingTree* lower_seeds, 
+    MeshingTree* spheres,           // <--- 新增
+    std::string remesh_filename, 
+    const char* output_filename)
+{
+    std::cout << "[Info] Checking seed pairs sidedness against " << remesh_filename << "..." << std::endl;
+
+    // 1. Load Remesh Object
+    size_t num_points = 0;
+    double** points = nullptr;
+    size_t num_faces = 0;
+    size_t** faces = nullptr;
+
+    if (read_input_obj_file(remesh_filename, num_points, points, num_faces, faces) != 0) {
+        std::cerr << "[Error] Failed to load remesh obj file." << std::endl;
+        return;
+    }
+
+    // 2. Build BVH
+    SimpleBVH bvh;
+    bvh.build(points, num_faces, faces);
+
+    // 3. Check Pairs and Export
+    std::ofstream out(output_filename);
+    out << std::fixed << std::setprecision(16);
+    out << "# Bad seed pairs (same side of surface) and their generating spheres\n";
+    out << "# Green = Upper Seed\n";
+    out << "# Red   = Lower Seed\n";
+    out << "# Yellow = Generating Sphere Centers\n";
+    out << "# Comments contain Sphere Radius and Center info\n";
+
+    size_t num_upper = upper_seeds->get_num_tree_points();
+    size_t num_lower = lower_seeds->get_num_tree_points();
+    size_t num_spheres_total = spheres->get_num_tree_points();
+    int bad_pair_count = 0;
+    
+    // OBJ 索引从 1 开始
+    size_t vert_offset = 1; 
+
+    for (size_t i = 0; i < num_upper; i++) {
+        if (!upper_seeds->tree_point_is_active(i)) continue;
+
+        double* p_up = upper_seeds->get_tree_point(i);
+        size_t* attrib = upper_seeds->get_tree_point_attrib(i);
+        size_t pair_idx = attrib[1];
+
+        // Check validity
+        if (pair_idx >= num_lower) continue; 
+        if (!lower_seeds->tree_point_is_active(pair_idx)) continue;
+
+        // Check if reciprocal
+        size_t* lower_attrib = lower_seeds->get_tree_point_attrib(pair_idx);
+        if (lower_attrib[1] != i) continue; // Not a matched pair
+
+        double* p_low = lower_seeds->get_tree_point(pair_idx);
+
+        // Ray cast p_up -> p_low
+        int intersections = bvh.count_intersections(p_up, p_low);
+
+        // 偶数次相交（包括0次）意味着在同侧 -> 错误
+        if (intersections % 2 == 0) {
+            bad_pair_count++;
+            
+            if (out.is_open()) {
+                // --- 1. 写入种子点 ---
+                // Upper Seed (Green)
+                out << "v " << p_up[0] << " " << p_up[1] << " " << p_up[2] << " 0.0 1.0 0.0\n"; 
+                size_t idx_up = vert_offset++;
+
+                // Lower Seed (Red)
+                out << "v " << p_low[0] << " " << p_low[1] << " " << p_low[2] << " 1.0 0.0 0.0\n";
+                size_t idx_low = vert_offset++;
+
+                // 绘制种子对连线
+                out << "l " << idx_up << " " << idx_low << "\n";
+
+                // --- 2. 写入生成该种子的三个球心及其信息 ---
+                size_t sphere_ids[3] = { attrib[2], attrib[3], attrib[4] };
+                size_t idx_spheres[3];
+
+                out << "# Bad Pair #" << bad_pair_count << ": Seed indices " << i << " & " << pair_idx << "\n";
+
+                for (int k = 0; k < 3; ++k) {
+                    size_t sid = sphere_ids[k];
+                    if (sid < num_spheres_total) {
+                        double sp_center[4];
+                        spheres->get_tree_point(sid, 4, sp_center); // sp_center[3] is radius
+                        
+                        // [输出要求] 输出球的半径和球心 (写入注释中)
+                        out << "#   Generating Sphere ID: " << sid 
+                            << ", Radius: " << sp_center[3] 
+                            << ", Center: " << sp_center[0] << " " << sp_center[1] << " " << sp_center[2] << "\n";
+
+                        // Sphere Center Vertex (Yellow)
+                        out << "v " << sp_center[0] << " " << sp_center[1] << " " << sp_center[2] << " 1.0 1.0 0.0\n";
+                        idx_spheres[k] = vert_offset++;
+                    } else {
+                        idx_spheres[k] = idx_up; // Fallback
+                    }
+                }
+
+                // --- 3. 绘制种子到球心的连线 ---
+                // [输出要求] 输出种子点到生成这个种子对的三个点的连线
+                for(int k=0; k<3; ++k) {
+                    // 连线：Upper Seed -> Sphere Center
+                    out << "l " << idx_up << " " << idx_spheres[k] << "\n";
+                    // 连线：Lower Seed -> Sphere Center
+                    out << "l " << idx_low << " " << idx_spheres[k] << "\n";
+                }
+            }
+        }
+    }
+
+    std::cout << "[Info] Sidedness check complete." << std::endl;
+    std::cout << "  * Total pairs checked: " << num_upper << std::endl; 
+    std::cout << "  * Bad pairs found: " << bad_pair_count << std::endl;
+    if (bad_pair_count > 0) {
+        std::cout << "  * Exported bad pairs details to " << output_filename << std::endl;
+    }
+
+    if (out.is_open()) out.close();
+
+    // Cleanup
+    for (size_t i = 0; i < num_points; i++) delete[] points[i];
+    delete[] points;
+    for (size_t i = 0; i < num_faces; i++) delete[] faces[i];
+    delete[] faces;
 }
 
 int Generator::read_input_obj_file(std::string filename, size_t &num_points, double** &points, size_t &num_faces, size_t** &faces)
@@ -237,10 +576,6 @@ void Generator::generate_surface_seeds(size_t num_points, double **points, size_
     
     // 辅助变量：用于优化循环中的临时计算
     double* temp_c_ijk = new double[3]; 
-    
-    // 几何辅助
-    double* fi_corners[3];
-    double fi_normal[3];
 
     std::vector<size_t> attrib;
     attrib.resize(6);
@@ -251,7 +586,7 @@ void Generator::generate_surface_seeds(size_t num_points, double **points, size_
     // 辅助 Lambda：检查当前球体配置是否合法，并计算 vi
     // 返回 true 表示合法且有交点，同时输出 vi 和 c_ijk
     auto check_configuration = [&](double* s_i, double* s_j, double* s_k, double& out_vi, double* out_c) -> bool {
-        // 1. 两两相交检查 (宽松检查，允许微小误差)
+        // 1. 两两相交检查
         if (_geom.distance(3, s_i, s_j) > s_i[3] + s_j[3] + 1E-10) return false;
         if (_geom.distance(3, s_i, s_k) > s_i[3] + s_k[3] + 1E-10) return false;
         if (_geom.distance(3, s_j, s_k) > s_j[3] + s_k[3] + 1E-10) return false;
@@ -263,7 +598,6 @@ void Generator::generate_surface_seeds(size_t num_points, double **points, size_
 
         // 3. 检查根心是否在球内 (深度检查)
         double hi = _geom.distance(3, out_c, s_i);
-        // 如果 hi > r，说明根心在球外，无公共交集
         if (hi > s_i[3] - 1e-10) return false;
 
         // 4. 计算垂直距离 vi
@@ -289,19 +623,32 @@ void Generator::generate_surface_seeds(size_t num_points, double **points, size_
         spheres->get_tree_point(j_sphere, 4, sphere_j);
         spheres->get_tree_point(k_sphere, 4, sphere_k);
 
-        // 2. 检查共线 (这是一个硬性几何约束，半径扩大无法解决共线问题，直接跳过)
+        // 2. 检查共线
         centers[0] = sphere_i; centers[1] = sphere_j; centers[2] = sphere_k;
+        // 这是一个硬性几何约束，如果三球心共线，无法确定平面，直接跳过
         if (_geom.get_3d_triangle_area(centers) < 1E-10) continue;
 
         // 3. 初始状态评估
         double current_vi = 0.0;
         bool is_valid = check_configuration(sphere_i, sphere_j, sphere_k, current_vi, c_ijk);
 
-        // 4. 判断是否需要修复
-        // 条件：如果不合法(无交点) 或者 种子距离过近(vi < 1e-4, 即总距离 < 2e-4)
-        // 目标：让 vi 至少达到 1.0001e-4
-        double target_vi = 1.0001e-4;
-        bool needs_fix = (!is_valid) || (current_vi < 1e-4);
+        // 4. 计算法线 (即三角形面法线)
+        // 注意：这里计算的法线方向由 OBJ 文件中顶点的顺序 (winding order) 决定
+        // 因为球心就是顶点，所以这就是网格面的法线。
+        _geom.get_3d_triangle_normal(centers, triplet_normal);
+
+        // === 修正后的距离计算 ===
+        // 因为球心在面上，dist_c 理论上为 0。但为了处理极其微小的浮点误差，我们还是计算一下。
+        // 这里直接使用 centers[0] 作为平面上的点，triplet_normal 作为法线。
+        double dist_c = 0.0;
+        for(int d=0; d<3; ++d) dist_c += (c_ijk[d] - centers[0][d]) * triplet_normal[d];
+        
+        // 目标 vi：必须大于这个（微小的）偏差，并加上安全距离 1e-4
+        double target_vi = fabs(dist_c) + 1e-4;
+
+        // 5. 判断是否需要修复
+        // 条件：如果不合法(无交点) 或者 vi 不足以跨越表面
+        bool needs_fix = (!is_valid) || (current_vi < target_vi);
 
         if (needs_fix) {
             // === 优化流程：寻找最佳球体进行扩大 ===
@@ -321,31 +668,35 @@ void Generator::generate_surface_seeds(size_t num_points, double **points, size_
                 spheres->get_tree_point(i_sphere, 4, sphere_i);
                 spheres->get_tree_point(j_sphere, 4, sphere_j);
                 spheres->get_tree_point(k_sphere, 4, sphere_k);
-                // 找到当前循环要修改的那个球的本地副本
+                
                 double* sim_target = (k == 0) ? sphere_i : ((k == 1) ? sphere_j : sphere_k);
 
-                // 二分查找：找到最小的 r 使得 configuration valid 且 vi >= target_vi
-                // 搜索范围：[r_orig, r_orig * 2.0]
+                // 二分查找
                 double r_low = r_orig;
                 double r_high = r_orig * 2.0; 
                 double r_found = -1.0;
 
                 for (int iter = 0; iter < 20; ++iter) {
                     double r_mid = (r_low + r_high) * 0.5;
-                    sim_target[3] = r_mid; // 修改半径
+                    sim_target[3] = r_mid; 
 
                     double temp_vi = 0.0;
                     bool ok = check_configuration(sphere_i, sphere_j, sphere_k, temp_vi, temp_c_ijk);
+                    
+                    // 重新计算法线和距离（因为球半径改变不会改变球心位置，所以法线不变，平面不变）
+                    // dist_c 理论上还是接近 0，但 c_ijk 移动了，所以重新算一下更严谨
+                    double temp_dist_c = 0.0;
+                    for(int d=0; d<3; ++d) temp_dist_c += (temp_c_ijk[d] - centers[0][d]) * triplet_normal[d];
+                    double temp_target_vi = fabs(temp_dist_c) + 1e-4;
 
-                    if (ok && temp_vi >= target_vi) {
+                    if (ok && temp_vi >= temp_target_vi) {
                         r_found = r_mid;
-                        r_high = r_mid; // 尝试更小的半径
+                        r_high = r_mid; 
                     } else {
-                        r_low = r_mid; // 需要更大的半径
+                        r_low = r_mid; 
                     }
                 }
 
-                // 如果找到了可行解，记录增量
                 if (r_found > 0.0) {
                     double delta = r_found - r_orig;
                     if (delta < min_radius_delta) {
@@ -359,62 +710,33 @@ void Generator::generate_surface_seeds(size_t num_points, double **points, size_
             // 应用最佳方案
             if (best_sphere_idx != -1) {
                 double* ptr = spheres->get_tree_point(best_sphere_idx);
-                
-                std::cout << "[Info] Face " << i << ": Expanded sphere " << best_sphere_idx 
-                          << " radius " << ptr[3] << " -> " << best_new_radius 
-                          << " (delta: " << min_radius_delta << ")" << std::endl;
-                
                 ptr[3] = best_new_radius;
 
-                // 重新加载数据并计算最终状态
+                // 重新加载数据
                 spheres->get_tree_point(i_sphere, 4, sphere_i);
                 spheres->get_tree_point(j_sphere, 4, sphere_j);
                 spheres->get_tree_point(k_sphere, 4, sphere_k);
                 
-                // 再次检查并获取最终的 c_ijk 和 vi
-                if (!check_configuration(sphere_i, sphere_j, sphere_k, current_vi, c_ijk)) {
-                    // 理论上不应发生，因为刚刚验证过
-                    continue; 
-                }
+                // 重新计算 c_ijk, vi, triplet_normal (虽然 normal 不会变)
+                check_configuration(sphere_i, sphere_j, sphere_k, current_vi, c_ijk);
+                centers[0] = sphere_i; centers[1] = sphere_j; centers[2] = sphere_k;
+                _geom.get_3d_triangle_normal(centers, triplet_normal);
             } else {
-                // 无法修复 (例如三个球离得太远，扩大两倍都不够)，跳过此面
-                // std::cerr << "[Warning] Failed to fix seed distance for face " << i << std::endl;
-                continue;
+                continue; // 无法修复，跳过
             }
         }
 
-        // === 成功路径：生成并添加种子 ===
-        // 此时 c_ijk 和 current_vi 已经是有效且满足距离要求的
-
-        // 5. 计算法线方向
-        centers[0] = sphere_i; centers[1] = sphere_j; centers[2] = sphere_k;
-        _geom.get_3d_triangle_normal(centers, triplet_normal);
-
-        // 6. 确定方向 (参考网格面法线)
-        size_t sphere_i_face;
-        spheres->get_tree_point_attrib(i_sphere, 0, sphere_i_face);
-        if (sphere_i_face >= num_faces) sphere_i_face = 0; // Safety
-
-        size_t fi_i1 = faces[sphere_i_face][1];
-        size_t fi_i2 = faces[sphere_i_face][2];
-        size_t fi_i3 = faces[sphere_i_face][3];
+        // 6. 确定方向
+        // 删除了之前基于 points[fi] 的错误判断。
+        // 我们直接信任 faces_flat 中的顶点顺序（右手定则）。
+        // 如果 OBJ 面法线朝外，则 triplet_normal 就朝外。
+        // 上种子(Upper) = c + vi * n， 下种子(Lower) = c - vi * n。
+        // 这样 Upper 在外，Lower 在内。
+        attrib[2] = i_sphere; attrib[3] = j_sphere; attrib[4] = k_sphere;
         
-        fi_corners[0] = points[fi_i1];
-        fi_corners[1] = points[fi_i2];
-        fi_corners[2] = points[fi_i3];
-        _geom.get_3d_triangle_normal(fi_corners, fi_normal);
-
-        double dot = _geom.dot_product(3, fi_normal, triplet_normal);
-        if (dot < 0.0) {
-            attrib[2] = i_sphere; attrib[3] = k_sphere; attrib[4] = j_sphere;
-            for (size_t idim = 0; idim < 3; idim++) triplet_normal[idim] = -triplet_normal[idim];
-        } else {
-            attrib[2] = i_sphere; attrib[3] = j_sphere; attrib[4] = k_sphere;
-        }
-
         // 7. 计算最终种子坐标
-        // 这里的 current_vi 已经保证 >= 1e-4，或者是初始就足够大
-        if (current_vi < 1e-4) current_vi = 1e-4; // 最后的安全钳制
+        // 最后的安全钳制
+        if (current_vi < 1e-4) current_vi = 1e-4; 
 
         for (size_t idim = 0; idim < 3; idim++) {
             upper_seed[idim] = c_ijk[idim] + current_vi * triplet_normal[idim];
@@ -447,6 +769,14 @@ void Generator::generate_surface_seeds(size_t num_points, double **points, size_
             upper_seeds->add_tree_point(4, upper_seed, triplet_normal, attrib.data());
         }
     }
+
+    check_seed_pairs_sidedness(
+        upper_seeds, 
+        lower_seeds, 
+        spheres,        // <--- 新增参数
+        "../data/obj/Ours_6000_mobius1_Remesh_Fixed.obj", 
+        "bad_pairs.obj"
+    );
 
     // Cleanup
     delete[] sphere_i; delete[] sphere_j; delete[] sphere_k;

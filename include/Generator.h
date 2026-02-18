@@ -48,6 +48,13 @@ public:
         double* spheres_sizing, 
         size_t* spheres_region_id
     );
+    void check_seed_pairs_sidedness(
+        MeshingTree* upper_seeds, 
+        MeshingTree* lower_seeds, 
+        MeshingTree* spheres,        // <--- 新增参数
+        std::string remesh_filename, 
+        const char* output_filename = "bad_pairs.obj"
+    );
 private:
     Methods _methods;
     Geometry _geom;
