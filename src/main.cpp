@@ -2,11 +2,14 @@
 #include "MeshingTree.h"
 #include <vector>
 #include <iostream>
+#include <map>
 #include <Eigen/Dense>
 #include <igl/readOBJ.h>
 #include <igl/writeOBJ.h>
 #include <igl/bfs_orient.h> // 用于统一面片方向
 #include <igl/volume.h>     // 用于计算体积判断朝向
+#include <numeric>
+#include <Eigen/Geometry>
 
 extern void optimizer(MeshingTree* seeds, MeshingTree* spheres, std::vector<int> face_flat);
 
@@ -15,14 +18,6 @@ size_t **faces;
 double *seeds_sizing, *seedes;
 size_t *seeds_region_id;
 std::vector<int> face_flat;
-#include <iostream>
-#include <vector>
-#include <numeric>
-#include <Eigen/Dense>
-#include <Eigen/Geometry>
-#include <igl/readOBJ.h>
-#include <igl/writeOBJ.h>
-#include <igl/bfs_orient.h>
 
 void FixMeshNormals(const std::string& input_path, const std::string& output_path) {
     Eigen::MatrixXd V;
@@ -77,33 +72,30 @@ void FixMeshNormals(const std::string& input_path, const std::string& output_pat
 }
 int main()
 {
-    FixMeshNormals("../data/obj/Ours_6000_mobius1_Remesh.obj", "../data/obj/Ours_6000_mobius1_Remesh_Fixed.obj");
+    FixMeshNormals("../data/obj/Ours_6000_block_Remesh_density_modified.obj", "../data/obj/Ours_6000_block_Remesh_density_modified_Fixed.obj");
     Generator generator;
     MeshingTree *spheres = new MeshingTree();
     MeshingTree *upper_seeds = new MeshingTree();
     MeshingTree *lower_seeds = new MeshingTree();
     MeshingTree *seeds = new MeshingTree();
     size_t num_points, num_faces, num_faces1;
-    generator.read_input_obj_file("../data/obj/mobius1.obj",num_points,points,num_faces,faces);
+    generator.read_input_obj_file("../data/obj/block.obj",num_points,points,num_faces,faces);
     if (num_points == 0) {
         std::cerr << "[Error] Failed to read input points or empty file." << std::endl;
         return 1;
     }
 
-    generator.generate_spheres("../data/spheres/Sphere_6000_55.csv", spheres);
+    generator.generate_spheres("../data/spheres/Sphere_6000_82_block.csv", spheres);
     if (spheres->get_num_tree_points() == 0) {
         std::cerr << "[Error] Failed to load spheres or empty file." << std::endl;
         return 1;
     }
 
-    generator.read_obj_faces("../data/obj/Ours_6000_mobius1_Remesh_Fixed.obj",face_flat, num_faces1);
+    generator.read_obj_faces("../data/obj/Ours_6000_block_Remesh_density_modified_Fixed.obj",face_flat, num_faces1);
     if (face_flat.empty()) {
         std::cerr << "[Error] Failed to read face indices or empty file." << std::endl;
         return 1;
     }
-
-    // generator.generate_surface_seeds(num_points, points, num_faces, faces,
-    //      spheres, upper_seeds, lower_seeds);
     generator.generate_surface_seeds(num_points, points, num_faces, faces,
         spheres, upper_seeds, lower_seeds, num_faces1, face_flat);
     generator.color_surface_seeds(num_faces1, spheres,upper_seeds, lower_seeds, seeds,
