@@ -17,8 +17,16 @@ if (USE_CGAL)
   find_package(CGAL CONFIG REQUIRED)
 endif()
 
-file(GLOB VOROCRUST_SOURCES
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
+set(VOROCRUST_SOURCES
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/Generator.cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/Geometry.cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/MeshingTree.cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/Methods.cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/offset.cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/RandomSampler.cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/VoronoiMesh.cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/inout.cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp"
 )
 
 add_executable(vorocrust ${VOROCRUST_SOURCES})

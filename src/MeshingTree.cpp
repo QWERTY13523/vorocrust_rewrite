@@ -7,6 +7,17 @@ MeshingTree::MeshingTree()
     _xmin.assign(3,DBL_MAX);
     _xmax.assign(3,-DBL_MAX);
     _num_dim = 0;
+    _capacity = 0;
+    _tree_root = 0;
+    _tree_max_height = 0;
+    _auto_balance = true;
+    _marked_only = false;
+    _is_redundant = false;
+}
+
+MeshingTree::~MeshingTree()
+{
+    clear_memory();
 }
 
 int MeshingTree::graph_connect_nodes(size_t ipoint, size_t jpoint)
@@ -42,9 +53,9 @@ int MeshingTree::add_tree_point(size_t num_dim, double* x, double* normal, size_
 {
 	
     _num_dim = static_cast<int>(num_dim);
-    if (_xmin.empty())
+    if (_xmin.size() < num_dim)
         _xmin.assign(num_dim, DBL_MAX);
-    if (_xmax.empty())
+    if (_xmax.size() < num_dim)
         _xmax.assign(num_dim, -DBL_MAX);
 
     for (size_t idim = 0; idim < num_dim; idim++)
@@ -99,23 +110,25 @@ int MeshingTree::add_tree_point(size_t num_dim, double* x, double* normal, size_
 
 int MeshingTree::get_tree_point(size_t point_index, double* x)
 {
-    if (point_index >= _points.size()) return -1;
+    if (point_index >= _points.size()) return 1;
     for (size_t idim = 0; idim < _num_dim; idim++) x[idim] = _points[point_index][idim];
     return 0;
 }
 
 int MeshingTree::get_tree_point(size_t point_index, size_t num_dim, double* x)
 {
-    if (point_index >= _points.size()) return -1;
-    for (size_t idim = 0; idim < num_dim; idim++) x[idim] = _points[point_index][idim];
+    if (point_index >= _points.size()) return 1;
+    size_t n = std::min(num_dim, _num_dim);
+    for (size_t idim = 0; idim < n; idim++) x[idim] = _points[point_index][idim];
     return 0;
 }
 
 bool MeshingTree::get_tree_point_attrib(size_t point_index, size_t attrib_index, size_t &point_attrib)
 {
-    if (point_index >= _points.size()) return false;
-    if (_points_attrib[point_index].empty()) return false;
-    point_attrib = _points_attrib[point_index][1 + attrib_index];
+    if (point_index >= _points_attrib.size()) return false;
+    if (_points_attrib[point_index].size() <= 1) return false;
+    if (attrib_index >= _points_attrib[point_index].size() - 1) return false;
+    point_attrib = _points_attrib[point_index][attrib_index + 1];
     return true;
 }
 
@@ -179,8 +192,9 @@ int MeshingTree::get_closest_tree_point(size_t tree_point_index, size_t &closest
 	#pragma region Closest Neighbor Search using tree:
 
 	closest_tree_point = _points.size();
+	if (_points.size() == 0) return 1;
+	if (tree_point_index >= _points.size()) return 1;
 	kd_tree_get_closest_seed(tree_point_index, 0, _tree_root, closest_tree_point, closest_distance);
-
 	return 0;
 	#pragma endregion
 }
@@ -191,27 +205,68 @@ int MeshingTree::kd_tree_get_closest_seed(double* x,                            
 	                                     size_t &num_nodes_visited                            // nodes visited
 	                                    )
 {
-	(void)d_index;
-	(void)node_index;
-	num_nodes_visited = 0;
-	closest_seed = _points.size();
-	closest_distance = DBL_MAX;
-	for (size_t i = 0; i < _points.size(); i++)
+	if (_points.empty() || node_index >= _points.size()) return 0;
+	if (d_index == _num_dim) d_index = 0;
+
+	num_nodes_visited++;
+
+	if (!_marked_only || _marked[node_index])
 	{
-		if (_marked_only && i < _marked.size() && !_marked[i]) continue;
 		double dst_sq = 0.0;
 		for (size_t idim = 0; idim < _num_dim; idim++)
 		{
-			double dx = _points[i][idim] - x[idim];
+			double dx = _points[node_index][idim] - x[idim];
 			dst_sq += dx * dx;
 		}
 		if (dst_sq < closest_distance * closest_distance)
 		{
-			closest_seed = i;
+			closest_seed = node_index;
 			closest_distance = sqrt(dst_sq);
 		}
-		num_nodes_visited++;
 	}
+
+	bool check_right(false), check_left(false);
+	double split = _points[node_index][d_index];
+
+	if (closest_distance == DBL_MAX)
+	{
+		if (_tree_right[node_index] != node_index) check_right = true;
+		if (_tree_left[node_index] != node_index) check_left = true;
+	}
+	else
+	{
+		double neighbor_min = x[d_index] - closest_distance;
+		double neighbor_max = x[d_index] + closest_distance;
+		if (_tree_right[node_index] != node_index && neighbor_max > split) check_right = true;
+		if (_tree_left[node_index] != node_index && neighbor_min < split) check_left = true;
+	}
+
+	if (check_right && check_left)
+	{
+		if (x[d_index] > split)
+		{
+			kd_tree_get_closest_seed(x, d_index + 1, _tree_right[node_index], closest_seed, closest_distance, num_nodes_visited);
+			double neighbor_min = x[d_index] - closest_distance;
+			if (neighbor_min < split)
+				kd_tree_get_closest_seed(x, d_index + 1, _tree_left[node_index], closest_seed, closest_distance, num_nodes_visited);
+		}
+		else
+		{
+			kd_tree_get_closest_seed(x, d_index + 1, _tree_left[node_index], closest_seed, closest_distance, num_nodes_visited);
+			double neighbor_max = x[d_index] + closest_distance;
+			if (neighbor_max > split)
+				kd_tree_get_closest_seed(x, d_index + 1, _tree_right[node_index], closest_seed, closest_distance, num_nodes_visited);
+		}
+	}
+	else if (check_right)
+	{
+		kd_tree_get_closest_seed(x, d_index + 1, _tree_right[node_index], closest_seed, closest_distance, num_nodes_visited);
+	}
+	else if (check_left)
+	{
+		kd_tree_get_closest_seed(x, d_index + 1, _tree_left[node_index], closest_seed, closest_distance, num_nodes_visited);
+	}
+
 	return 0;
 }
 
@@ -222,28 +277,75 @@ int MeshingTree::kd_tree_get_closest_seed(double* x,                            
 	                                     size_t &num_nodes_visited                            // nodes visited
 	                                    )
 {
-	(void)d_index;
-	(void)node_index;
-	num_nodes_visited = 0;
-	closest_seed = _points.size();
-	closest_distance = DBL_MAX;
-	for (size_t i = 0; i < _points.size(); i++)
+	if (_points.empty() || node_index >= _points.size()) return 0;
+	if (d_index == _num_dim) d_index = 0;
+
+	num_nodes_visited++;
+
+	if ((!_marked_only || _marked[node_index]) &&
+		!find_brute(node_index, exculded_tree_points, num_exculded_tree_points))
 	{
-		if (_marked_only && i < _marked.size() && !_marked[i]) continue;
-		if (find_brute(i, exculded_tree_points, num_exculded_tree_points)) continue;
 		double dst_sq = 0.0;
 		for (size_t idim = 0; idim < _num_dim; idim++)
 		{
-			double dx = _points[i][idim] - x[idim];
+			double dx = _points[node_index][idim] - x[idim];
 			dst_sq += dx * dx;
 		}
 		if (dst_sq < closest_distance * closest_distance)
 		{
-			closest_seed = i;
+			closest_seed = node_index;
 			closest_distance = sqrt(dst_sq);
 		}
-		num_nodes_visited++;
 	}
+
+	bool check_right(false), check_left(false);
+	double split = _points[node_index][d_index];
+
+	if (closest_distance == DBL_MAX)
+	{
+		if (_tree_right[node_index] != node_index) check_right = true;
+		if (_tree_left[node_index] != node_index) check_left = true;
+	}
+	else
+	{
+		double neighbor_min = x[d_index] - closest_distance;
+		double neighbor_max = x[d_index] + closest_distance;
+		if (_tree_right[node_index] != node_index && neighbor_max > split) check_right = true;
+		if (_tree_left[node_index] != node_index && neighbor_min < split) check_left = true;
+	}
+
+	if (check_right && check_left)
+	{
+		if (x[d_index] > split)
+		{
+			kd_tree_get_closest_seed(x, d_index + 1, _tree_right[node_index], num_exculded_tree_points, exculded_tree_points,
+				closest_seed, closest_distance, num_nodes_visited);
+			double neighbor_min = x[d_index] - closest_distance;
+			if (neighbor_min < split)
+				kd_tree_get_closest_seed(x, d_index + 1, _tree_left[node_index], num_exculded_tree_points, exculded_tree_points,
+					closest_seed, closest_distance, num_nodes_visited);
+		}
+		else
+		{
+			kd_tree_get_closest_seed(x, d_index + 1, _tree_left[node_index], num_exculded_tree_points, exculded_tree_points,
+				closest_seed, closest_distance, num_nodes_visited);
+			double neighbor_max = x[d_index] + closest_distance;
+			if (neighbor_max > split)
+				kd_tree_get_closest_seed(x, d_index + 1, _tree_right[node_index], num_exculded_tree_points, exculded_tree_points,
+					closest_seed, closest_distance, num_nodes_visited);
+		}
+	}
+	else if (check_right)
+	{
+		kd_tree_get_closest_seed(x, d_index + 1, _tree_right[node_index], num_exculded_tree_points, exculded_tree_points,
+			closest_seed, closest_distance, num_nodes_visited);
+	}
+	else if (check_left)
+	{
+		kd_tree_get_closest_seed(x, d_index + 1, _tree_left[node_index], num_exculded_tree_points, exculded_tree_points,
+			closest_seed, closest_distance, num_nodes_visited);
+	}
+
 	return 0;
 }
 

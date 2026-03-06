@@ -1,0 +1,4 @@
+# sphere shrink blocked report
+# format: iter, target_face, sphere, reason
+iter=0, target_face=(2372,3623,7923), sphere=3623, reason=sphere already shrunk once in this iteration
+iter=0, target_face=(2372,3623,7923), sphere=7923, reason=no valid shrink radius found by binary search

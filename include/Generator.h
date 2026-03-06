@@ -21,8 +21,10 @@ public:
     void generate_spheres(const char* filename, MeshingTree *&spheres);
     void read_obj_faces(const char* filename, std::vector<int>& faces_flat, size_t& num_faces);
     //void generate_connections(const char* filename, std::vector<std::vector<std::tuple<size_t,size_t,size_t>>> &connections);
-    void generate_surface_seeds(size_t num_points, double **points, size_t num_faces, size_t **faces,
+    void generate_surface_seeds(
          MeshingTree *surface_spheres,MeshingTree *upper_seeds, MeshingTree *lower_seeds);
+    void generate_surface_seeds(
+         MeshingTree *spheres,MeshingTree *upper_seeds, MeshingTree *lower_seeds, size_t number_of_facets, std::vector<int> faces_flat);
     void color_surface_seeds(
         int num_faces, 
         MeshingTree *surface_spheres, 
@@ -30,12 +32,12 @@ public:
         MeshingTree *lower_seeds, 
         MeshingTree *seeds,
         std::vector<int> face, 
-        double** points,
         double* &seedes, 
         size_t* &seeds_region_id, 
         double* &seeds_sizing
     );
-    void generate_surface_mesh(MeshingTree* seeds, const char* output_filename);
+    void ensure_seed_pair_adjacency(MeshingTree* seeds);
+    void generate_surface_mesh(MeshingTree* seeds, MeshingTree* spheres, const char* output_filename);
     void generate_surface_mesh1(MeshingTree* seeds, const char* output_filename);
     void generate_seed_csv(
         const char* filename, 
@@ -44,6 +46,25 @@ public:
         double* spheres, 
         double* spheres_sizing, 
         size_t* spheres_region_id
+    );
+    void generate_seed_csv_with_faces(
+        const char* filename,
+        MeshingTree* seeds,
+        MeshingTree* spheres,
+        const char* faces_obj_filename = "seed_faces.obj"
+    );
+    size_t collect_active_seeds(
+        MeshingTree* seeds,
+        double* &seedes,
+        size_t* &seeds_region_id,
+        double* &seeds_sizing
+    );
+    void check_seed_pairs_sidedness(
+        MeshingTree* upper_seeds, 
+        MeshingTree* lower_seeds, 
+        MeshingTree* spheres,        // Additional spheres parameter (new argument)
+        std::string remesh_filename, 
+        const char* output_filename = "bad_pairs.obj"
     );
 private:
     Methods _methods;

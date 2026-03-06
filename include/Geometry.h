@@ -40,6 +40,15 @@ public:
 	int project_to_3d_line_segment(double* p, double* xo, double* xn, double* q, double& proj_dist);
 
 	int project_to_3d_line(double* p, double* xo, double* edir, double* q, double &proj_dist);
+
+	// Curvature proxy based on normal variation.
+	// Returns the average angular deviation (radians) between n0 and neighbor normals.
+	// Returns DBL_MAX if n0 is degenerate or there are no usable neighbors.
+	double estimate_curvature_normal_variation(
+		const double* n0,
+		const double* neighbor_normals,
+		size_t num_neighbors,
+		size_t stride = 3);
 private:
 	MeshingRandomSampler _rsampler;
 };
