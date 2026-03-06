@@ -20,7 +20,6 @@ double *seeds_sizing, *seedes;
 size_t *seeds_region_id;
 std::vector<int> face_flat;
 
-
 void FixMeshNormals(const std::string& input_path, const std::string& output_path) {
     Eigen::MatrixXd V;
     Eigen::MatrixXi F;

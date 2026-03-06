@@ -830,29 +830,9 @@ void Generator::generate_surface_seeds(
                     bool ok = check_configuration(sphere_i, sphere_j, sphere_k, temp_vi, temp_c_ijk);
                     
                     double temp_target_vi = 1e-5;
-
-                    if (ok && temp_vi >= temp_target_vi) {
-                        r_found = r_mid;
-                        r_high = r_mid; 
-                    } else {
-                        r_low = r_mid; 
-                    }
-                }
-
-                if (r_found > 0.0) {
-                    double delta = r_found - r_orig;
-                    if (delta < min_radius_delta) {
-                        min_radius_delta = delta;
-                        best_new_radius = r_found;
-                        best_sphere_idx = target_idx;
-                    }
-                }
-            }
-
-            // Apply the best solution
-            if (best_sphere_idx != -1) {
-                double* ptr = spheres->get_tree_point(best_sphere_idx);
-                ptr[3] = best_new_radius;
+                    if (best_sphere_idx != -1) {
+                        double* ptr = spheres->get_tree_point(best_sphere_idx);
+                        ptr[3] = best_new_radius;
 
                 // Reload the data
                 spheres->get_tree_point(i_sphere, 4, sphere_i);

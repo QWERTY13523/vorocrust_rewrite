@@ -54,7 +54,9 @@ int MeshingTree::add_tree_point(size_t num_dim, double* x, double* normal, size_
 	
     _num_dim = static_cast<int>(num_dim);
     if (_xmin.size() < num_dim)
+    if (_xmin.size() < num_dim)
         _xmin.assign(num_dim, DBL_MAX);
+    if (_xmax.size() < num_dim)
     if (_xmax.size() < num_dim)
         _xmax.assign(num_dim, -DBL_MAX);
 
@@ -111,12 +113,16 @@ int MeshingTree::add_tree_point(size_t num_dim, double* x, double* normal, size_
 int MeshingTree::get_tree_point(size_t point_index, double* x)
 {
     if (point_index >= _points.size()) return 1;
+    if (point_index >= _points.size()) return 1;
     for (size_t idim = 0; idim < _num_dim; idim++) x[idim] = _points[point_index][idim];
     return 0;
 }
 
 int MeshingTree::get_tree_point(size_t point_index, size_t num_dim, double* x)
 {
+    if (point_index >= _points.size()) return 1;
+    size_t n = std::min(num_dim, _num_dim);
+    for (size_t idim = 0; idim < n; idim++) x[idim] = _points[point_index][idim];
     if (point_index >= _points.size()) return 1;
     size_t n = std::min(num_dim, _num_dim);
     for (size_t idim = 0; idim < n; idim++) x[idim] = _points[point_index][idim];
