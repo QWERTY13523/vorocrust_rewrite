@@ -20,6 +20,157 @@ Generator::~Generator()
 
 }
 
+namespace {
+
+bool trim_and_parse_seed_line(
+    const std::string& raw_line,
+    double& x,
+    double& y,
+    double& z,
+    bool& has_point
+)
+{
+    std::string line = raw_line;
+    if (!line.empty() && static_cast<unsigned char>(line[0]) == 0xEF) {
+        if (line.size() >= 3 &&
+            static_cast<unsigned char>(line[1]) == 0xBB &&
+            static_cast<unsigned char>(line[2]) == 0xBF) {
+            line.erase(0, 3);
+        }
+    }
+
+    const size_t comment_pos = line.find('#');
+    if (comment_pos != std::string::npos) {
+        line.erase(comment_pos);
+    }
+
+    for (char& ch : line) {
+        if (ch == ',' || ch == '\t' || ch == '\r') {
+            ch = ' ';
+        }
+    }
+
+    std::istringstream ss(line);
+    if (!(ss >> x >> y >> z)) {
+        has_point = false;
+        return ss.eof();
+    }
+
+    std::string extra;
+    if (ss >> extra) {
+        has_point = false;
+        return false;
+    }
+
+    has_point = true;
+    return true;
+}
+
+bool trim_and_parse_seed_pair_line(
+    const std::string& raw_line,
+    double& inner_x,
+    double& inner_y,
+    double& inner_z,
+    double& outer_x,
+    double& outer_y,
+    double& outer_z,
+    bool& has_pair
+)
+{
+    std::string line = raw_line;
+    if (!line.empty() && static_cast<unsigned char>(line[0]) == 0xEF) {
+        if (line.size() >= 3 &&
+            static_cast<unsigned char>(line[1]) == 0xBB &&
+            static_cast<unsigned char>(line[2]) == 0xBF) {
+            line.erase(0, 3);
+        }
+    }
+
+    const size_t comment_pos = line.find('#');
+    if (comment_pos != std::string::npos) {
+        line.erase(comment_pos);
+    }
+
+    for (char& ch : line) {
+        if (ch == ',' || ch == '\t' || ch == '\r') {
+            ch = ' ';
+        }
+    }
+
+    std::istringstream ss(line);
+    if (!(ss >> inner_x >> inner_y >> inner_z >> outer_x >> outer_y >> outer_z)) {
+        has_pair = false;
+        return ss.eof();
+    }
+
+    std::string extra;
+    if (ss >> extra) {
+        has_pair = false;
+        return false;
+    }
+
+    has_pair = true;
+    return true;
+}
+
+bool looks_like_seed_pair_header(const std::string& raw_line)
+{
+    std::string line = raw_line;
+    if (!line.empty() && static_cast<unsigned char>(line[0]) == 0xEF) {
+        if (line.size() >= 3 &&
+            static_cast<unsigned char>(line[1]) == 0xBB &&
+            static_cast<unsigned char>(line[2]) == 0xBF) {
+            line.erase(0, 3);
+        }
+    }
+
+    const size_t comment_pos = line.find('#');
+    if (comment_pos != std::string::npos) {
+        line.erase(comment_pos);
+    }
+
+    for (char& ch : line) {
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    }
+
+    return line.find("inner_x") != std::string::npos &&
+           line.find("inner_y") != std::string::npos &&
+           line.find("inner_z") != std::string::npos &&
+           line.find("outer_x") != std::string::npos &&
+           line.find("outer_y") != std::string::npos &&
+           line.find("outer_z") != std::string::npos;
+}
+
+bool read_next_seed_point(
+    std::ifstream& input,
+    const char* filename,
+    size_t& line_number,
+    double& x,
+    double& y,
+    double& z
+)
+{
+    std::string line;
+    while (std::getline(input, line)) {
+        ++line_number;
+
+        bool has_point = false;
+        if (!trim_and_parse_seed_line(line, x, y, z, has_point)) {
+            std::cerr << "[Error] Invalid seed line in " << filename
+                      << " at line " << line_number << ": " << line << std::endl;
+            return false;
+        }
+
+        if (has_point) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+} // namespace
+
 int Generator::read_input_obj_file(
     std::string filename,
     size_t& num_points,
@@ -791,62 +942,94 @@ void Generator::generate_surface_seeds(
         // Since the sphere centers are the vertices, this becomes the mesh face normal
         _geom.get_3d_triangle_normal(centers, triplet_normal);
         
-        double target_vi = 1e-5;
-        // 5. Determine whether repair is needed
-        // Condition: invalid (no intersection) or vi insufficient to cross the surface
-        bool needs_fix = (!is_valid) || (current_vi < target_vi);
+        // double target_vi = 1e-5;
+	    //     // 5. Determine whether repair is needed
+	    //     // Condition: invalid (no intersection) or vi insufficient to cross the surface
+	    //     bool needs_fix = (!is_valid) || (current_vi < target_vi);
 
-        if (needs_fix) {
-            // === Optimization step: find the best sphere to expand ===
-            int best_sphere_idx = -1;
-            double best_new_radius = -1.0;
-            double min_radius_delta = DBL_MAX;
+	    //     if (needs_fix)
+	    //     {
+	    //         // Expand one of the three generating spheres so that the power vertex
+	    //         // exists and the computed vi is large enough to cross the surface.
+	    //         int best_sphere_idx = -1;
+	    //         double best_new_radius = -1.0;
+	    //         double min_radius_delta = DBL_MAX;
 
-            int sphere_indices[3] = {i_sphere, j_sphere, k_sphere};
+	    //         const int sphere_indices[3] = {i_sphere, j_sphere, k_sphere};
 
-            // Iterate over the three spheres on the face and attempt to expand each
-            for (int k = 0; k < 3; ++k) {
-                int target_idx = sphere_indices[k];
-                double* target_ptr = spheres->get_tree_point(target_idx);
-                double r_orig = target_ptr[3];
+	    //         for (int k = 0; k < 3; ++k)
+	    //         {
+	    //             const int target_idx = sphere_indices[k];
+	    //             const double* target_ptr = spheres->get_tree_point(target_idx);
+	    //             const double r_orig = target_ptr[3];
 
-                // Prepare temporary sphere data for the simulation
-                spheres->get_tree_point(i_sphere, 4, sphere_i);
-                spheres->get_tree_point(j_sphere, 4, sphere_j);
-                spheres->get_tree_point(k_sphere, 4, sphere_k);
-                
-                double* sim_target = (k == 0) ? sphere_i : ((k == 1) ? sphere_j : sphere_k);
+	    //             // Load a fresh copy of the triplet. We'll modify one radius in-place.
+	    //             spheres->get_tree_point(i_sphere, 4, sphere_i);
+	    //             spheres->get_tree_point(j_sphere, 4, sphere_j);
+	    //             spheres->get_tree_point(k_sphere, 4, sphere_k);
 
-                // Binary search
-                double r_low = r_orig;
-                double r_high = r_orig * 2.0; 
-                double r_found = -1.0;
+	    //             double* sim_target = (k == 0) ? sphere_i : ((k == 1) ? sphere_j : sphere_k);
 
-                for (int iter = 0; iter < 20; ++iter) {
-                    double r_mid = (r_low + r_high) * 0.5;
-                    sim_target[3] = r_mid; 
+	    //             const double temp_target_vi = target_vi;
+	    //             double r_low = r_orig;
+	    //             double r_high = r_orig * 2.0;
 
-                    double temp_vi = 0.0;
-                    bool ok = check_configuration(sphere_i, sphere_j, sphere_k, temp_vi, temp_c_ijk);
-                    
-                    double temp_target_vi = 1e-5;
-                    if (best_sphere_idx != -1) {
-                        double* ptr = spheres->get_tree_point(best_sphere_idx);
-                        ptr[3] = best_new_radius;
+	    //             // Ensure we have an upper bound that satisfies the condition.
+	    //             bool hi_ok = false;
+	    //             double hi_vi = 0.0;
+	    //             for (int expand = 0; expand < 10; ++expand)
+	    //             {
+	    //                 sim_target[3] = r_high;
+	    //                 hi_ok = check_configuration(sphere_i, sphere_j, sphere_k, hi_vi, temp_c_ijk) &&
+	    //                         (hi_vi >= temp_target_vi);
+	    //                 if (hi_ok) break;
+	    //                 r_high *= 2.0;
+	    //             }
+	    //             if (!hi_ok) continue;
 
-                // Reload the data
-                spheres->get_tree_point(i_sphere, 4, sphere_i);
-                spheres->get_tree_point(j_sphere, 4, sphere_j);
-                spheres->get_tree_point(k_sphere, 4, sphere_k);
-                
-                // Recompute c_ijk, vi, and triplet_normal (the normal itself remains unchanged)
-                check_configuration(sphere_i, sphere_j, sphere_k, current_vi, c_ijk);
-                centers[0] = sphere_i; centers[1] = sphere_j; centers[2] = sphere_k;
-                _geom.get_3d_triangle_normal(centers, triplet_normal);
-            } else {
-                continue; // Unable to repair, skip
-            }
-        }
+	    //             // Binary search for the smallest radius that satisfies the condition.
+	    //             for (int iter = 0; iter < 25; ++iter)
+	    //             {
+	    //                 const double r_mid = 0.5 * (r_low + r_high);
+	    //                 sim_target[3] = r_mid;
+
+	    //                 double mid_vi = 0.0;
+	    //                 const bool mid_ok = check_configuration(sphere_i, sphere_j, sphere_k, mid_vi, temp_c_ijk) &&
+	    //                                     (mid_vi >= temp_target_vi);
+	    //                 if (mid_ok)
+	    //                     r_high = r_mid;
+	    //                 else
+	    //                     r_low = r_mid;
+	    //             }
+
+	    //             const double r_found = r_high;
+	    //             const double delta = r_found - r_orig;
+	    //             if (delta >= 0.0 && delta < min_radius_delta)
+	    //             {
+	    //                 min_radius_delta = delta;
+	    //                 best_sphere_idx = target_idx;
+	    //                 best_new_radius = r_found;
+	    //             }
+	    //         }
+
+	    //         if (best_sphere_idx == -1)
+	    //         {
+	    //             continue; // Unable to repair, skip this facet
+	    //         }
+
+	    //         // Apply the chosen radius update to the actual tree point.
+	    //         double* best_ptr = spheres->get_tree_point(best_sphere_idx);
+	    //         best_ptr[3] = best_new_radius;
+
+	    //         // Reload the data and recompute for seed placement.
+	    //         spheres->get_tree_point(i_sphere, 4, sphere_i);
+	    //         spheres->get_tree_point(j_sphere, 4, sphere_j);
+	    //         spheres->get_tree_point(k_sphere, 4, sphere_k);
+
+	    //         check_configuration(sphere_i, sphere_j, sphere_k, current_vi, c_ijk);
+	    //         centers[0] = sphere_i; centers[1] = sphere_j; centers[2] = sphere_k;
+	    //         _geom.get_3d_triangle_normal(centers, triplet_normal);
+	    //     }
 
         // 6. Determine the direction
         // Removes the previous incorrect check based on points[fi]
@@ -903,6 +1086,168 @@ void Generator::generate_surface_seeds(
     delete[] c_ijk; delete[] centers; delete[] radii;
     delete[] triplet_normal; delete[] upper_seed; delete[] lower_seed;
     delete[] temp_c_ijk;
+}
+
+bool Generator::load_paired_seeds_from_txt(
+    const char* inner_filename,
+    const char* outer_filename,
+    MeshingTree* seeds
+)
+{
+    if (!inner_filename || !outer_filename || !seeds) {
+        std::cerr << "[Error] load_paired_seeds_from_txt: invalid arguments." << std::endl;
+        return false;
+    }
+
+    std::ifstream inner_file(inner_filename);
+    if (!inner_file.is_open()) {
+        std::cerr << "[Error] Cannot open inner seed file: " << inner_filename << std::endl;
+        return false;
+    }
+
+    std::ifstream outer_file(outer_filename);
+    if (!outer_file.is_open()) {
+        std::cerr << "[Error] Cannot open outer seed file: " << outer_filename << std::endl;
+        return false;
+    }
+
+    seeds->clear_memory();
+
+    size_t inner_line_number = 0;
+    size_t outer_line_number = 0;
+    size_t pair_count = 0;
+    const size_t invalid_face_index = static_cast<size_t>(-1);
+
+    while (true) {
+        double inner_x = 0.0, inner_y = 0.0, inner_z = 0.0;
+        double outer_x = 0.0, outer_y = 0.0, outer_z = 0.0;
+
+        const bool has_inner = read_next_seed_point(
+            inner_file, inner_filename, inner_line_number, inner_x, inner_y, inner_z);
+        const bool has_outer = read_next_seed_point(
+            outer_file, outer_filename, outer_line_number, outer_x, outer_y, outer_z);
+
+        if (!has_inner && !has_outer) {
+            break;
+        }
+
+        if (has_inner != has_outer) {
+            std::cerr << "[Error] inner/outer seed counts do not match."
+                      << " Parsed pairs: " << pair_count
+                      << ", inner lines consumed: " << inner_line_number
+                      << ", outer lines consumed: " << outer_line_number
+                      << std::endl;
+            seeds->clear_memory();
+            return false;
+        }
+
+        const size_t outer_index = static_cast<size_t>(seeds->get_num_tree_points());
+        const size_t inner_index = outer_index + 1;
+        const double dx = outer_x - inner_x;
+        const double dy = outer_y - inner_y;
+        const double dz = outer_z - inner_z;
+        const double pair_radius = 0.5 * std::sqrt(dx * dx + dy * dy + dz * dz);
+
+        double outer_seed[4] = { outer_x, outer_y, outer_z, pair_radius };
+        double inner_seed[4] = { inner_x, inner_y, inner_z, pair_radius };
+        size_t outer_attrib[6] = { 6, inner_index, invalid_face_index, invalid_face_index, invalid_face_index, 0 };
+        size_t inner_attrib[6] = { 6, outer_index, invalid_face_index, invalid_face_index, invalid_face_index, 1 };
+
+        seeds->add_tree_point(4, outer_seed, nullptr, outer_attrib);
+        seeds->add_tree_point(4, inner_seed, nullptr, inner_attrib);
+        ++pair_count;
+    }
+
+    if (pair_count == 0) {
+        std::cerr << "[Error] No valid seed pairs were read from "
+                  << inner_filename << " and " << outer_filename << std::endl;
+        return false;
+    }
+
+    std::cout << "[Info] Loaded " << pair_count
+              << " seed pairs from " << inner_filename
+              << " and " << outer_filename << std::endl;
+    return true;
+}
+
+bool Generator::load_paired_seeds_from_csv(
+    const char* filename,
+    MeshingTree* seeds
+)
+{
+    if (!filename || !seeds) {
+        std::cerr << "[Error] load_paired_seeds_from_csv: invalid arguments." << std::endl;
+        return false;
+    }
+
+    std::ifstream input(filename);
+    if (!input.is_open()) {
+        std::cerr << "[Error] Cannot open paired seed file: " << filename << std::endl;
+        return false;
+    }
+
+    seeds->clear_memory();
+
+    std::string line;
+    size_t line_number = 0;
+    size_t pair_count = 0;
+    bool data_started = false;
+    const size_t invalid_face_index = static_cast<size_t>(-1);
+
+    while (std::getline(input, line)) {
+        ++line_number;
+
+        double inner_x = 0.0;
+        double inner_y = 0.0;
+        double inner_z = 0.0;
+        double outer_x = 0.0;
+        double outer_y = 0.0;
+        double outer_z = 0.0;
+        bool has_pair = false;
+
+        if (!trim_and_parse_seed_pair_line(
+                line, inner_x, inner_y, inner_z, outer_x, outer_y, outer_z, has_pair)) {
+            if (!data_started && looks_like_seed_pair_header(line)) {
+                continue;
+            }
+
+            std::cerr << "[Error] Invalid paired seed line in " << filename
+                      << " at line " << line_number << ": " << line << std::endl;
+            seeds->clear_memory();
+            return false;
+        }
+
+        if (!has_pair) {
+            continue;
+        }
+
+        data_started = true;
+
+        const size_t outer_index = static_cast<size_t>(seeds->get_num_tree_points());
+        const size_t inner_index = outer_index + 1;
+        const double dx = outer_x - inner_x;
+        const double dy = outer_y - inner_y;
+        const double dz = outer_z - inner_z;
+        const double pair_radius = 0.5 * std::sqrt(dx * dx + dy * dy + dz * dz);
+
+        double outer_seed[4] = { outer_x, outer_y, outer_z, pair_radius };
+        double inner_seed[4] = { inner_x, inner_y, inner_z, pair_radius };
+        size_t outer_attrib[6] = { 6, inner_index, invalid_face_index, invalid_face_index, invalid_face_index, 0 };
+        size_t inner_attrib[6] = { 6, outer_index, invalid_face_index, invalid_face_index, invalid_face_index, 1 };
+
+        seeds->add_tree_point(4, outer_seed, nullptr, outer_attrib);
+        seeds->add_tree_point(4, inner_seed, nullptr, inner_attrib);
+        ++pair_count;
+    }
+
+    if (pair_count == 0) {
+        std::cerr << "[Error] No valid seed pairs were read from " << filename << std::endl;
+        return false;
+    }
+
+    std::cout << "[Info] Loaded " << pair_count
+              << " seed pairs from " << filename << std::endl;
+    return true;
 }
 
 // void Generator::generate_surface_seeds(size_t num_points, double **points, size_t num_faces, size_t **faces,
@@ -1435,57 +1780,68 @@ void Generator::color_surface_seeds(int num_faces, MeshingTree *surface_spheres,
         }
     }
 
-    // 3. Color seeds using surface sphere normals (outside=0, inside=1)
-    size_t num_spheres = surface_spheres->get_num_tree_points();
-    auto compute_seed_dot = [&](size_t seed_index) -> double {
-        double seed[4];
-        seeds->get_tree_point(seed_index, 4, seed);
-        size_t* attrib = seeds->get_tree_point_attrib(seed_index);
-        size_t sphere_indices[3] = {attrib[2], attrib[3], attrib[4]};
+	// 3. Color seeds using surface sphere normals (outside=0, inside=1)
+	size_t num_spheres = surface_spheres->get_num_tree_points();
+	// IMPORTANT:
+	// Do NOT use the per-vertex normals from surface_spheres to decide inside/outside.
+	// For some inputs those normals are inconsistent, which makes labels effectively random (~50%).
+	// Instead, use the seed's own face normal (stored when generating the seed) and the face centroid.
+	// With FixMeshNormals() upstream, face winding is globally consistent (and flipped outward by volume),
+	// so "positive along the face normal" is outside.
+	auto compute_seed_signed_offset = [&](size_t seed_index) -> double {
+		double seed[4];
+		seeds->get_tree_point(seed_index, 4, seed);
+		size_t* attrib = seeds->get_tree_point_attrib(seed_index);
+		size_t sphere_indices[3] = {attrib[2], attrib[3], attrib[4]};
 
-        double dot_sum = 0.0;
-        int count = 0;
-        for (size_t i = 0; i < 3; ++i) {
-            size_t si = sphere_indices[i];
-            if (si >= num_spheres) continue;
-            double center[4];
-            surface_spheres->get_tree_point(si, 4, center);
-            double* normal = surface_spheres->get_tree_point_normal(si);
-            double nx = normal[0];
-            double ny = normal[1];
-            double nz = normal[2];
-            double nlen_sq = nx * nx + ny * ny + nz * nz;
-            if (nlen_sq < 1e-20) continue;
-            double dx = seed[0] - center[0];
-            double dy = seed[1] - center[1];
-            double dz = seed[2] - center[2];
-            dot_sum += dx * nx + dy * ny + dz * nz;
-            count++;
-        }
-        if (count == 0) return 0.0;
-        return dot_sum / static_cast<double>(count);
-    };
+		double c[3] = {0.0, 0.0, 0.0};
+		int count = 0;
+		for (size_t i = 0; i < 3; ++i) {
+			const size_t si = sphere_indices[i];
+			if (si >= num_spheres) continue;
+			double center[4];
+			surface_spheres->get_tree_point(si, 4, center);
+			c[0] += center[0];
+			c[1] += center[1];
+			c[2] += center[2];
+			count++;
+		}
+		if (count == 0) return 0.0;
+		c[0] /= static_cast<double>(count);
+		c[1] /= static_cast<double>(count);
+		c[2] /= static_cast<double>(count);
 
-    for (size_t iseed = 0; iseed < num_seeds; ++iseed)
-    {
-        if (!seeds->tree_point_is_active(iseed)) continue;
-        size_t* attrib = seeds->get_tree_point_attrib(iseed);
-        size_t jseed = attrib[1];
-        if (jseed >= num_seeds || !seeds->tree_point_is_active(jseed))
-        {
-            double dot = compute_seed_dot(iseed);
-            attrib[5] = (dot < 0.0) ? 1 : 0;
-            continue;
-        }
-        if (iseed > jseed) continue;
+		double* n = seeds->get_tree_point_normal(seed_index);
+		const double nx = n ? n[0] : 0.0;
+		const double ny = n ? n[1] : 0.0;
+		const double nz = n ? n[2] : 0.0;
+		const double dx = seed[0] - c[0];
+		const double dy = seed[1] - c[1];
+		const double dz = seed[2] - c[2];
+		return dx * nx + dy * ny + dz * nz;
+	};
 
-        double dot_i = compute_seed_dot(iseed);
-        double dot_j = compute_seed_dot(jseed);
-        size_t outside_seed = (dot_i >= dot_j) ? iseed : jseed;
-        size_t inside_seed = (outside_seed == iseed) ? jseed : iseed;
-        seeds->get_tree_point_attrib(outside_seed)[5] = 0;
-        seeds->get_tree_point_attrib(inside_seed)[5] = 1;
-    }
+	for (size_t iseed = 0; iseed < num_seeds; ++iseed)
+	{
+		if (!seeds->tree_point_is_active(iseed)) continue;
+		size_t* attrib = seeds->get_tree_point_attrib(iseed);
+		size_t jseed = attrib[1];
+		if (jseed >= num_seeds || !seeds->tree_point_is_active(jseed))
+		{
+			const double offset = compute_seed_signed_offset(iseed);
+			// outside=0, inside=1
+			attrib[5] = (offset < 0.0) ? 1 : 0;
+			continue;
+		}
+		if (iseed > jseed) continue;
+
+		const double offset_i = compute_seed_signed_offset(iseed);
+		const double offset_j = compute_seed_signed_offset(jseed);
+		size_t outside_seed = (offset_i >= offset_j) ? iseed : jseed;
+		size_t inside_seed = (outside_seed == iseed) ? jseed : iseed;
+		seeds->get_tree_point_attrib(outside_seed)[5] = 0;
+		seeds->get_tree_point_attrib(inside_seed)[5] = 1;
+	}
 
 }
 // void Generator::color_surface_seeds(int num_faces, MeshingTree *surface_spheres, MeshingTree *upper_seeds, MeshingTree *lower_seeds, MeshingTree *seeds,
@@ -1895,39 +2251,51 @@ void Generator::generate_seed_csv(const char* filename, int num_dim, size_t num_
 }
 
 void Generator::generate_seed_csv_with_faces(
-    const char* filename,
+    const char* pair_filename,
+    const char* point_filename,
     MeshingTree* seeds,
-    MeshingTree* spheres,
-    const char* faces_obj_filename
+    MeshingTree* spheres
 )
 {
-    if (!filename || !seeds) {
+    if (!pair_filename || !point_filename || !seeds) {
         std::cerr << "[Error] generate_seed_csv_with_faces: invalid arguments." << std::endl;
         return;
     }
 
-    std::ofstream file(filename);
-    if (!file.is_open()) {
-        std::cerr << "[Error] generate_seed_csv_with_faces: cannot open " << filename << std::endl;
+    std::ofstream pair_file(pair_filename);
+    if (!pair_file.is_open()) {
+        std::cerr << "[Error] generate_seed_csv_with_faces: cannot open " << pair_filename << std::endl;
         return;
     }
 
-    file << "outside_x, outside_y, outside_z, inside_x, inside_y, inside_z" << std::endl;
+    std::ofstream point_file(point_filename);
+    if (!point_file.is_open()) {
+        std::cerr << "[Error] generate_seed_csv_with_faces: cannot open " << point_filename << std::endl;
+        return;
+    }
 
-    std::ofstream faces_obj;
-    if (faces_obj_filename && faces_obj_filename[0] != '\0') {
-        faces_obj.open(faces_obj_filename);
-        if (faces_obj.is_open()) {
-            faces_obj << std::fixed << std::setprecision(16);
-            faces_obj << "# Seed face triangles (sphere centers)\n";
-        }
+    pair_file << std::fixed << std::setprecision(16);
+    point_file << std::fixed << std::setprecision(16);
+
+    const bool has_faces = (spheres != nullptr);
+
+    if (has_faces) {
+        pair_file << "inside_x, inside_y, inside_z, outside_x, outside_y, outside_z, "
+                  << "face_v0_x, face_v0_y, face_v0_z, "
+                  << "face_v1_x, face_v1_y, face_v1_z, "
+                  << "face_v2_x, face_v2_y, face_v2_z" << std::endl;
+        point_file << "point_x, point_y, point_z, "
+                   << "face_v0_x, face_v0_y, face_v0_z, "
+                   << "face_v1_x, face_v1_y, face_v1_z, "
+                   << "face_v2_x, face_v2_y, face_v2_z" << std::endl;
+    } else {
+        pair_file << "inside_x, inside_y, inside_z, outside_x, outside_y, outside_z" << std::endl;
+        point_file << "point_x, point_y, point_z" << std::endl;
     }
 
     const size_t num_seeds = static_cast<size_t>(seeds->get_num_tree_points());
-    const size_t num_spheres = spheres ? static_cast<size_t>(spheres->get_num_tree_points()) : 0;
-    std::set<std::tuple<size_t, size_t, size_t>> written_faces;
+    const size_t num_spheres = has_faces ? static_cast<size_t>(spheres->get_num_tree_points()) : 0;
     std::set<std::pair<size_t, size_t>> written_pairs;
-    size_t face_vertex_offset = 1;
 
     for (size_t iseed = 0; iseed < num_seeds; ++iseed) {
         if (!seeds->tree_point_is_active(iseed)) continue;
@@ -1941,65 +2309,133 @@ void Generator::generate_seed_csv_with_faces(
         if (!written_pairs.insert(std::make_pair(a, b)).second) continue;
 
         size_t* attrib_j = seeds->get_tree_point_attrib(jseed);
-        const size_t region_i = attrib_i ? attrib_i[5] : static_cast<size_t>(0);
-        const size_t region_j = attrib_j ? attrib_j[5] : static_cast<size_t>(1);
-
         size_t outside_seed = iseed;
         size_t inside_seed = jseed;
-        if (region_i == 1 && region_j == 0) {
-            outside_seed = jseed;
-            inside_seed = iseed;
-        } else if (region_i != 0 && region_j == 0) {
-            outside_seed = jseed;
-            inside_seed = iseed;
-        } else if (region_i != 0 && region_j != 1) {
-            outside_seed = a;
-            inside_seed = b;
-        }
 
         double outside_pt[4] = {0, 0, 0, 0};
         double inside_pt[4] = {0, 0, 0, 0};
+        seeds->get_tree_point(iseed, 4, outside_pt);
+        seeds->get_tree_point(jseed, 4, inside_pt);
+
+        if (!has_faces) {
+            // Fallback: no face information, so rely on stored region labels if available.
+            const size_t region_i = attrib_i ? attrib_i[5] : static_cast<size_t>(0);
+            const size_t region_j = attrib_j ? attrib_j[5] : static_cast<size_t>(1);
+            outside_seed = iseed;
+            inside_seed = jseed;
+            if (region_i == 1 && region_j == 0) {
+                outside_seed = jseed;
+                inside_seed = iseed;
+            } else if (region_i != 0 && region_j == 0) {
+                outside_seed = jseed;
+                inside_seed = iseed;
+            } else if (region_i != 0 && region_j != 1) {
+                outside_seed = a;
+                inside_seed = b;
+            }
+            seeds->get_tree_point(outside_seed, 4, outside_pt);
+            seeds->get_tree_point(inside_seed, 4, inside_pt);
+
+            pair_file << inside_pt[0] << ", " << inside_pt[1] << ", " << inside_pt[2] << ", "
+                      << outside_pt[0] << ", " << outside_pt[1] << ", " << outside_pt[2]
+                      << std::endl;
+
+            point_file << outside_pt[0] << ", " << outside_pt[1] << ", " << outside_pt[2] << std::endl;
+            point_file << inside_pt[0] << ", " << inside_pt[1] << ", " << inside_pt[2] << std::endl;
+            continue;
+        }
+
+        // Use the face normal from the fixed/consistent mesh winding to decide inside/outside,
+        // instead of trusting attrib[5].  The generating face vertex indices (attrib[2..4])
+        // preserve the OBJ winding; with FixMeshNormals() upstream, the resulting normal points outward.
+        size_t* attrib_for_face = attrib_i ? attrib_i : attrib_j;
+        const size_t f0 = attrib_for_face ? attrib_for_face[2] : static_cast<size_t>(-1);
+        const size_t f1 = attrib_for_face ? attrib_for_face[3] : static_cast<size_t>(-1);
+        const size_t f2 = attrib_for_face ? attrib_for_face[4] : static_cast<size_t>(-1);
+        if (f0 >= num_spheres || f1 >= num_spheres || f2 >= num_spheres) {
+            continue;
+        }
+
+        double f0p[4] = {0, 0, 0, 0};
+        double f1p[4] = {0, 0, 0, 0};
+        double f2p[4] = {0, 0, 0, 0};
+        spheres->get_tree_point(f0, 4, f0p);
+        spheres->get_tree_point(f1, 4, f1p);
+        spheres->get_tree_point(f2, 4, f2p);
+
+        const double cx = (f0p[0] + f1p[0] + f2p[0]) / 3.0;
+        const double cy = (f0p[1] + f1p[1] + f2p[1]) / 3.0;
+        const double cz = (f0p[2] + f1p[2] + f2p[2]) / 3.0;
+
+        const double e10x = f1p[0] - f0p[0];
+        const double e10y = f1p[1] - f0p[1];
+        const double e10z = f1p[2] - f0p[2];
+        const double e20x = f2p[0] - f0p[0];
+        const double e20y = f2p[1] - f0p[1];
+        const double e20z = f2p[2] - f0p[2];
+        // n = (v1 - v0) x (v2 - v0)
+        double nx = e10y * e20z - e10z * e20y;
+        double ny = e10z * e20x - e10x * e20z;
+        double nz = e10x * e20y - e10y * e20x;
+        const double nlen = std::sqrt(nx * nx + ny * ny + nz * nz);
+        if (nlen > 1e-30) {
+            nx /= nlen;
+            ny /= nlen;
+            nz /= nlen;
+        }
+
+        // Signed offsets along outward normal: larger => further outside.
+        const double di =
+            (outside_pt[0] - cx) * nx + (outside_pt[1] - cy) * ny + (outside_pt[2] - cz) * nz;
+        const double dj =
+            (inside_pt[0] - cx) * nx + (inside_pt[1] - cy) * ny + (inside_pt[2] - cz) * nz;
+        if (nlen > 1e-30) {
+            if (dj > di) {
+                // swap: jseed is outside, iseed is inside
+                outside_seed = jseed;
+                inside_seed = iseed;
+            } else {
+                outside_seed = iseed;
+                inside_seed = jseed;
+            }
+        } else {
+            // Degenerate face: fallback to stored region labels.
+            const size_t region_i = attrib_i ? attrib_i[5] : static_cast<size_t>(0);
+            const size_t region_j = attrib_j ? attrib_j[5] : static_cast<size_t>(1);
+            outside_seed = iseed;
+            inside_seed = jseed;
+            if (region_i == 1 && region_j == 0) {
+                outside_seed = jseed;
+                inside_seed = iseed;
+            } else if (region_i != 0 && region_j == 0) {
+                outside_seed = jseed;
+                inside_seed = iseed;
+            } else if (region_i != 0 && region_j != 1) {
+                outside_seed = a;
+                inside_seed = b;
+            }
+        }
+
         seeds->get_tree_point(outside_seed, 4, outside_pt);
         seeds->get_tree_point(inside_seed, 4, inside_pt);
 
-        file << std::setprecision(16)
-             << outside_pt[0] << ", " << outside_pt[1] << ", " << outside_pt[2] << ", "
-             << inside_pt[0] << ", " << inside_pt[1] << ", " << inside_pt[2]
-             << std::endl;
+        pair_file << inside_pt[0] << ", " << inside_pt[1] << ", " << inside_pt[2] << ", "
+                  << outside_pt[0] << ", " << outside_pt[1] << ", " << outside_pt[2] << ", "
+                  << f0p[0] << ", " << f0p[1] << ", " << f0p[2] << ", "
+                  << f1p[0] << ", " << f1p[1] << ", " << f1p[2] << ", "
+                  << f2p[0] << ", " << f2p[1] << ", " << f2p[2]
+                  << std::endl;
 
-        if (faces_obj.is_open()) {
-            size_t* outside_attrib = seeds->get_tree_point_attrib(outside_seed);
-            const size_t f0 = outside_attrib ? outside_attrib[2] : static_cast<size_t>(-1);
-            const size_t f1 = outside_attrib ? outside_attrib[3] : static_cast<size_t>(-1);
-            const size_t f2 = outside_attrib ? outside_attrib[4] : static_cast<size_t>(-1);
-            if (f0 < num_spheres && f1 < num_spheres && f2 < num_spheres) {
-                double f0p[4] = {0, 0, 0, 0};
-                double f1p[4] = {0, 0, 0, 0};
-                double f2p[4] = {0, 0, 0, 0};
-                spheres->get_tree_point(f0, 4, f0p);
-                spheres->get_tree_point(f1, 4, f1p);
-                spheres->get_tree_point(f2, 4, f2p);
-
-                size_t a = f0, b = f1, c = f2;
-                if (a > b) std::swap(a, b);
-                if (b > c) std::swap(b, c);
-                if (a > b) std::swap(a, b);
-                auto key = std::make_tuple(a, b, c);
-                if (written_faces.insert(key).second) {
-                    faces_obj << "v " << f0p[0] << " " << f0p[1] << " " << f0p[2] << "\n";
-                    faces_obj << "v " << f1p[0] << " " << f1p[1] << " " << f1p[2] << "\n";
-                    faces_obj << "v " << f2p[0] << " " << f2p[1] << " " << f2p[2] << "\n";
-                    faces_obj << "f " << face_vertex_offset
-                              << " " << (face_vertex_offset + 1)
-                              << " " << (face_vertex_offset + 2) << "\n";
-                    face_vertex_offset += 3;
-                }
-            }
-        }
-    }
-
-    if (faces_obj.is_open()) {
-        faces_obj.close();
+        point_file << outside_pt[0] << ", " << outside_pt[1] << ", " << outside_pt[2] << ", "
+                   << f0p[0] << ", " << f0p[1] << ", " << f0p[2] << ", "
+                   << f1p[0] << ", " << f1p[1] << ", " << f1p[2] << ", "
+                   << f2p[0] << ", " << f2p[1] << ", " << f2p[2]
+                   << std::endl;
+        point_file << inside_pt[0] << ", " << inside_pt[1] << ", " << inside_pt[2] << ", "
+                   << f0p[0] << ", " << f0p[1] << ", " << f0p[2] << ", "
+                   << f1p[0] << ", " << f1p[1] << ", " << f1p[2] << ", "
+                   << f2p[0] << ", " << f2p[1] << ", " << f2p[2]
+                   << std::endl;
     }
 }
 

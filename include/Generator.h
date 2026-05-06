@@ -25,6 +25,15 @@ public:
          MeshingTree *surface_spheres,MeshingTree *upper_seeds, MeshingTree *lower_seeds);
     void generate_surface_seeds(
          MeshingTree *spheres,MeshingTree *upper_seeds, MeshingTree *lower_seeds, size_t number_of_facets, std::vector<int> faces_flat);
+    bool load_paired_seeds_from_txt(
+        const char* inner_filename,
+        const char* outer_filename,
+        MeshingTree* seeds
+    );
+    bool load_paired_seeds_from_csv(
+        const char* filename,
+        MeshingTree* seeds
+    );
     void color_surface_seeds(
         int num_faces, 
         MeshingTree *surface_spheres, 
@@ -38,8 +47,6 @@ public:
     );
     void ensure_seed_pair_adjacency(MeshingTree* seeds);
     void generate_surface_mesh(MeshingTree* seeds, MeshingTree* spheres, const char* output_filename);
-    void ensure_seed_pair_adjacency(MeshingTree* seeds);
-    void generate_surface_mesh(MeshingTree* seeds, MeshingTree* spheres, const char* output_filename);
     void generate_surface_mesh1(MeshingTree* seeds, const char* output_filename);
     void generate_seed_csv(
         const char* filename, 
@@ -50,10 +57,10 @@ public:
         size_t* spheres_region_id
     );
     void generate_seed_csv_with_faces(
-        const char* filename,
+        const char* pair_filename,
+        const char* point_filename,
         MeshingTree* seeds,
-        MeshingTree* spheres,
-        const char* faces_obj_filename = "seed_faces.obj"
+        MeshingTree* spheres
     );
     size_t collect_active_seeds(
         MeshingTree* seeds,

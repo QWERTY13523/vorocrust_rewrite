@@ -1,4 +1,6 @@
 # sphere shrink blocked report
 # format: iter, target_face, sphere, reason
-iter=0, target_face=(2372,3623,7923), sphere=3623, reason=sphere already shrunk once in this iteration
-iter=0, target_face=(2372,3623,7923), sphere=7923, reason=no valid shrink radius found by binary search
+iter=0, target_face=(6087,14632,18418), sphere=6087, reason=no valid shrink radius found by binary search
+iter=0, target_face=(6087,14632,18418), sphere=14632, reason=sphere already shrunk once in this iteration
+iter=0, target_face=(7992,12477,16567), sphere=7992, reason=no valid shrink radius found by binary search
+iter=0, target_face=(7992,12477,16567), sphere=12477, reason=sphere already shrunk once in this iteration
