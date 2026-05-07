@@ -9,8 +9,11 @@
 #include <set>
 #include <string>
 #include <array>
+#include <tuple>
 #include <vector>
 #include <sstream>
+#include <unordered_map>
+#include <unordered_set>
 
 #include <CGAL/Exact_predicates_exact_constructions_kernel.h>
 #include <CGAL/Delaunay_triangulation_3.h>
@@ -1250,66 +1253,10 @@ void Generator::generate_surface_mesh(MeshingTree* seeds, MeshingTree* spheres, 
             std::cerr << "Error: Cannot write to seed_pairs.obj" << std::endl;
         }
     }
-    // 2. Collect Voronoi facets for inside/outside seed pairs
-    std::vector<std::vector<Point_3>> voronoi_facets;
-    
-    for (auto eit = dt.finite_edges_begin(); eit != dt.finite_edges_end(); ++eit) {
-        Cell_handle c = eit->first;
-        int i1 = eit->second;
-        int i2 = eit->third;
-        
-        Vertex_handle v1 = c->vertex(i1);
-        Vertex_handle v2 = c->vertex(i2);
-        
-        size_t seed_idx1 = v1->info();
-        size_t seed_idx2 = v2->info();
-        
-        // Check if this edge connects a seed pair (inside/outside)
-       // Check if this Delaunay edge connects an original paired seed pair.
-        size_t* attrib1 = seeds->get_tree_point_attrib(seed_idx1);
-        size_t* attrib2 = seeds->get_tree_point_attrib(seed_idx2);
-
-        // 1. 必须 inside / outside 标签不同
-        if (attrib1[5] == attrib2[5]) continue;
-
-        // 2. 必须是原始成对 seed
-        auto strict_key = pair_key(seed_idx1, seed_idx2);
-        bool is_strict_pair =
-            strict_seed_pair_keys.find(strict_key) != strict_seed_pair_keys.end();
-
-        if (!is_strict_pair) continue;
-
-        // 3. 可选但建议：强制检查 attrib[1] 是否互相指向
-        // 如果你的 seed pair 一定是严格互指的，这个判断可以保留，能防止脏数据。
-        bool is_reciprocal_pair =
-            attrib1[1] == seed_idx2 &&
-            attrib2[1] == seed_idx1;
-
-        if (!is_reciprocal_pair) continue;
-        // This edge connects a seed pair - extract the dual Voronoi facet
-        // The Voronoi facet is the convex polygon formed by circumcenters of 
-        // cells incident to this edge
-        std::vector<Point_3> facet_vertices;
-        
-        Delaunay::Cell_circulator cc = dt.incident_cells(*eit);
-        Delaunay::Cell_circulator done = cc;
-        
-        if (cc == nullptr) continue;
-        
-        do {
-            if (!dt.is_infinite(cc)) {
-                Point_3 center = dt.dual(cc); 
-                facet_vertices.push_back(center);
-            }
-            ++cc;
-        } while (cc != done);
-        
-        if (facet_vertices.size() >= 3) {
-            voronoi_facets.push_back(facet_vertices);
-        }
-    }
-    
-    std::cout << "  * Found " << voronoi_facets.size() << " Voronoi facets for seed pairs" << std::endl;
+    // 2. Surface extraction is now handled by the topological Delaunay-Voronoi dual
+    //    in exportBoundarySurfaceImproved() below.  We intentionally do not build
+    //    a separate point-only facet list here, because that was the source of
+    //    per-face duplicated OBJ vertices.
 
     // 3. Write Surface Mesh OBJ file
     /*
@@ -1402,6 +1349,147 @@ void Generator::generate_surface_mesh(MeshingTree* seeds, MeshingTree* spheres, 
             size_t* attrib = seeds->get_tree_point_attrib(i);
             vertex_labels[vh] = static_cast<int>(attrib[5]);
         }
+
+        auto write_voronoi_facets_original_obj = [&](
+            const std::string& filename,
+            const std::vector<std::vector<Point_3>>& voronoi_facets,
+            const std::vector<std::array<size_t, 8>>* facet_sources = nullptr,
+            const std::string& sources_filename = "voronoi_original_map.csv"
+        ) {
+            std::ofstream out(filename);
+            if (!out) {
+                std::cerr << "Cannot open file " << filename << std::endl;
+                return;
+            }
+
+            out << "# Original strict-pair Voronoi polygon facets OBJ\n";
+            out << "# Same printed coordinates share one OBJ vertex index.\n";
+            out << "# No epsilon merge, no coordinate-neighborhood deduplication, no triangulation.\n";
+            out << "# Face duplicate indices are cleaned only by removing consecutive and closing duplicates; ring order is preserved.\n";
+
+            // 注意：这里不是 epsilon 合并。
+            // 只把最终 OBJ 中打印出来完全相同的坐标复用为同一个 vertex index。
+            // 这可以解决每个面重复创建同一坐标顶点的问题。
+            std::map<std::string, int> vertex_key_to_index;
+            std::vector<Point_3> vertices;
+            std::vector<std::vector<int>> faces;
+            std::vector<size_t> face_src_facet;
+
+            vertices.reserve(voronoi_facets.size() * 4 + 16);
+            faces.reserve(voronoi_facets.size());
+            face_src_facet.reserve(voronoi_facets.size());
+
+            auto make_vertex_key = [&](const Point_3& p) -> std::string {
+                std::ostringstream oss;
+                oss << std::fixed << std::setprecision(16)
+                    << CGAL::to_double(p.x()) << " "
+                    << CGAL::to_double(p.y()) << " "
+                    << CGAL::to_double(p.z());
+                return oss.str();
+            };
+
+            auto get_vertex_index = [&](const Point_3& p) -> int {
+                std::string key = make_vertex_key(p);
+                auto it = vertex_key_to_index.find(key);
+                if (it != vertex_key_to_index.end()) {
+                    return it->second;
+                }
+
+                int idx = static_cast<int>(vertices.size()) + 1; // OBJ is 1-based
+                vertex_key_to_index[key] = idx;
+                vertices.push_back(p);
+                return idx;
+            };
+
+            size_t input_facets = 0;
+            size_t exported_faces = 0;
+            size_t dropped_lt3 = 0;
+            size_t duplicate_refs_removed = 0;
+
+            for (size_t facet_idx = 0; facet_idx < voronoi_facets.size(); ++facet_idx) {
+                const auto& facet = voronoi_facets[facet_idx];
+                input_facets++;
+
+                if (facet.size() < 3) {
+                    dropped_lt3++;
+                    continue;
+                }
+
+                std::vector<int> face;
+                face.reserve(facet.size());
+                for (const auto& p : facet) {
+                    face.push_back(get_vertex_index(p));
+                }
+
+                const size_t before_cleanup = face.size();
+
+                // 只删除连续重复 index 和首尾重复 index，保留 incident_cells 给出的环序。
+                // 不做 sort，不删除非连续重复 index，也不因为 face 内存在重复 index 就跳过整张面。
+                std::vector<int> cleaned_face;
+                cleaned_face.reserve(face.size());
+                for (int idx : face) {
+                    if (idx <= 0) continue;
+                    if (!cleaned_face.empty() && cleaned_face.back() == idx) {
+                        duplicate_refs_removed++;
+                        continue;
+                    }
+                    cleaned_face.push_back(idx);
+                }
+                if (cleaned_face.size() > 1 && cleaned_face.front() == cleaned_face.back()) {
+                    cleaned_face.pop_back();
+                    duplicate_refs_removed++;
+                }
+
+                if (cleaned_face.size() < 3) {
+                    dropped_lt3++;
+                    continue;
+                }
+
+                faces.push_back(std::move(cleaned_face));
+                face_src_facet.push_back(facet_idx);
+                exported_faces++;
+            }
+
+            out << std::fixed << std::setprecision(16);
+
+            for (const auto& p : vertices) {
+                out << "v "
+                    << CGAL::to_double(p.x()) << " "
+                    << CGAL::to_double(p.y()) << " "
+                    << CGAL::to_double(p.z()) << "\n";
+            }
+
+            for (const auto& f : faces) {
+                out << "f";
+                for (int idx : f) {
+                    out << " " << idx;
+                }
+                out << "\n";
+            }
+
+            std::cout << "  * Original strict-pair Voronoi OBJ exported: " << filename << std::endl;
+            std::cout << "    input_facets = " << input_facets << std::endl;
+            std::cout << "    exported_faces = " << exported_faces << std::endl;
+            std::cout << "    vertices = " << vertices.size() << std::endl;
+            std::cout << "    dropped_lt3 = " << dropped_lt3 << std::endl;
+            std::cout << "    duplicate_refs_removed = " << duplicate_refs_removed << std::endl;
+
+            if (facet_sources && facet_sources->size() == voronoi_facets.size()) {
+                std::ofstream meta_out(sources_filename);
+                if (meta_out.is_open()) {
+                    meta_out << "face_index_0based,face_index_1based,src_facet_index,seed_a,seed_b,"
+                             << "seed_a_s0,seed_a_s1,seed_a_s2,seed_b_s0,seed_b_s1,seed_b_s2\n";
+                    for (size_t face_idx = 0; face_idx < face_src_facet.size(); ++face_idx) {
+                        size_t src = face_src_facet[face_idx];
+                        const auto& m = (*facet_sources)[src];
+                        meta_out << face_idx << "," << (face_idx + 1) << "," << src << ","
+                                 << m[0] << "," << m[1] << ","
+                                 << m[2] << "," << m[3] << "," << m[4] << ","
+                                 << m[5] << "," << m[6] << "," << m[7] << "\n";
+                    }
+                }
+            }
+        };
 
         auto write_voronoi_facets_to_obj = [&](
             const std::string& filename,
@@ -1801,185 +1889,334 @@ void Generator::generate_surface_mesh(MeshingTree* seeds, MeshingTree* spheres, 
             std::cout << "  * Saved to " << filename << std::endl;
         };
 
-        // auto exportBoundarySurfaceImproved = [&](const std::string& filename) {
+        // Directly compute the common Voronoi-cell face for each strict seed pair.
+        // This implements:
+        //   V_i ∩ V_j = Π_ij ∩ ⋂_{k≠i,j}{ x | ||x-s_i|| <= ||x-s_k|| }
+        // where Π_ij is the perpendicular bisector plane of the seed pair.
+        // It does NOT use Delaunay tetrahedron circumcenters to form the polygon vertices.
         auto exportBoundarySurfaceImproved = [&]() {
-            /*
-            std::ofstream out(filename);
-            if (!out) {
-                std::cerr << "Error: Cannot create file " << filename << std::endl;
+            std::cout << "\n=== Extracting Boundary Surface (Direct Voronoi Cell Intersection, Strict Pair) ===" << std::endl;
+
+            struct Vec3 {
+                double x, y, z;
+            };
+
+            auto make_vec = [](double x, double y, double z) -> Vec3 {
+                return Vec3{x, y, z};
+            };
+            auto add = [](const Vec3& a, const Vec3& b) -> Vec3 {
+                return Vec3{a.x + b.x, a.y + b.y, a.z + b.z};
+            };
+            auto sub = [](const Vec3& a, const Vec3& b) -> Vec3 {
+                return Vec3{a.x - b.x, a.y - b.y, a.z - b.z};
+            };
+            auto mul = [](const Vec3& a, double s) -> Vec3 {
+                return Vec3{a.x * s, a.y * s, a.z * s};
+            };
+            auto dot = [](const Vec3& a, const Vec3& b) -> double {
+                return a.x * b.x + a.y * b.y + a.z * b.z;
+            };
+            auto cross = [](const Vec3& a, const Vec3& b) -> Vec3 {
+                return Vec3{
+                    a.y * b.z - a.z * b.y,
+                    a.z * b.x - a.x * b.z,
+                    a.x * b.y - a.y * b.x
+                };
+            };
+            auto norm2 = [&](const Vec3& a) -> double {
+                return dot(a, a);
+            };
+            auto norm = [&](const Vec3& a) -> double {
+                return std::sqrt(norm2(a));
+            };
+            auto normalize = [&](const Vec3& a) -> Vec3 {
+                double l = norm(a);
+                if (l <= 1e-300) return Vec3{0.0, 0.0, 0.0};
+                return mul(a, 1.0 / l);
+            };
+            auto lerp = [&](const Vec3& a, const Vec3& b, double t) -> Vec3 {
+                return Vec3{
+                    a.x + (b.x - a.x) * t,
+                    a.y + (b.y - a.y) * t,
+                    a.z + (b.z - a.z) * t
+                };
+            };
+            auto sqdist = [&](const Vec3& a, const Vec3& b) -> double {
+                return norm2(sub(a, b));
+            };
+
+            // ------------------------------------------------------------------
+            // Step 1. Cache all reconstruction seed positions.
+            // The Voronoi diagram here is defined only by reconstruction seeds,
+            // i.e. active seeds participating in strict inside/outside pairs.
+            // ------------------------------------------------------------------
+            std::vector<Vec3> seed_pos(num_seeds, Vec3{0.0, 0.0, 0.0});
+            std::vector<char> seed_pos_valid(num_seeds, false);
+            std::vector<size_t> reconstruction_seed_ids;
+            reconstruction_seed_ids.reserve(static_cast<size_t>(dt.number_of_vertices()));
+
+            Vec3 bb_min{ DBL_MAX, DBL_MAX, DBL_MAX };
+            Vec3 bb_max{-DBL_MAX,-DBL_MAX,-DBL_MAX };
+
+            for (size_t sid = 0; sid < num_seeds; ++sid) {
+                if (!seeds->tree_point_is_active(sid)) continue;
+                if (!reconstruction_seed_indices[sid]) continue;
+
+                double* p = seeds->get_tree_point(sid);
+                Vec3 q{p[0], p[1], p[2]};
+                seed_pos[sid] = q;
+                seed_pos_valid[sid] = true;
+                reconstruction_seed_ids.push_back(sid);
+
+                bb_min.x = std::min(bb_min.x, q.x);
+                bb_min.y = std::min(bb_min.y, q.y);
+                bb_min.z = std::min(bb_min.z, q.z);
+                bb_max.x = std::max(bb_max.x, q.x);
+                bb_max.y = std::max(bb_max.y, q.y);
+                bb_max.z = std::max(bb_max.z, q.z);
+            }
+
+            if (reconstruction_seed_ids.empty()) {
+                std::cerr << "Error: no reconstruction seed positions available." << std::endl;
                 return;
             }
 
-            out << "# Voronoi boundary surface (improved with validation)" << std::endl;
-            */
-            std::cout << "\n=== Extracting Boundary Surface (Improved) ===" << std::endl;
+            const double bbox_diag = std::max(1e-12, norm(sub(bb_max, bb_min)));
+            const double initial_half_size = 8.0 * bbox_diag;
+            const double clip_tol = 1e-12 * std::max(1.0, bbox_diag * bbox_diag);
+            const double cleanup_eps = 1e-12 * bbox_diag;
+            const double cleanup_eps2 = cleanup_eps * cleanup_eps;
 
-            int total_edges = 0;
-            int boundary_edges_count = 0;
-            int boundary_pair_edges = 0;
-            int boundary_non_pair_edges = 0;
-            int inner_edges = 0;
-            int outer_edges = 0;
-            int no_label_edges = 0;
+            // ------------------------------------------------------------------
+            // Clip a convex polygon by one Voronoi halfspace:
+            //   ||x-a||^2 <= ||x-k||^2
+            // equivalent to:
+            //   2(k-a)·x <= |k|^2 - |a|^2
+            // We represent the inside value as:
+            //   value(x) = rhs - 2(k-a)·x >= 0
+            // ------------------------------------------------------------------
+            auto clip_polygon_by_seed_halfspace = [&](const std::vector<Vec3>& poly,
+                                                       const Vec3& a,
+                                                       const Vec3& k) -> std::vector<Vec3> {
+                if (poly.empty()) return {};
 
-            std::vector<std::vector<Point_3>> facets;
+                const Vec3 ka = sub(k, a);
+                const double rhs = norm2(k) - norm2(a);
+
+                auto value = [&](const Vec3& x) -> double {
+                    return rhs - 2.0 * dot(ka, x);
+                };
+
+                std::vector<Vec3> out;
+                out.reserve(poly.size() + 2);
+
+                Vec3 prev = poly.back();
+                double f_prev = value(prev);
+                bool prev_inside = (f_prev >= -clip_tol);
+
+                for (const Vec3& curr : poly) {
+                    double f_curr = value(curr);
+                    bool curr_inside = (f_curr >= -clip_tol);
+
+                    if (prev_inside && curr_inside) {
+                        out.push_back(curr);
+                    } else if (prev_inside && !curr_inside) {
+                        double denom = f_prev - f_curr;
+                        if (std::abs(denom) > 1e-300) {
+                            double t = f_prev / denom;
+                            if (t < 0.0) t = 0.0;
+                            if (t > 1.0) t = 1.0;
+                            out.push_back(lerp(prev, curr, t));
+                        }
+                    } else if (!prev_inside && curr_inside) {
+                        double denom = f_prev - f_curr;
+                        if (std::abs(denom) > 1e-300) {
+                            double t = f_prev / denom;
+                            if (t < 0.0) t = 0.0;
+                            if (t > 1.0) t = 1.0;
+                            out.push_back(lerp(prev, curr, t));
+                        }
+                        out.push_back(curr);
+                    }
+
+                    prev = curr;
+                    f_prev = f_curr;
+                    prev_inside = curr_inside;
+                }
+
+                return out;
+            };
+
+            auto cleanup_polygon_points = [&](const std::vector<Vec3>& poly) -> std::vector<Vec3> {
+                std::vector<Vec3> out;
+                out.reserve(poly.size());
+                for (const Vec3& p : poly) {
+                    if (!out.empty() && sqdist(out.back(), p) <= cleanup_eps2) {
+                        continue;
+                    }
+                    out.push_back(p);
+                }
+                if (out.size() > 1 && sqdist(out.front(), out.back()) <= cleanup_eps2) {
+                    out.pop_back();
+                }
+                return out;
+            };
+
+            auto compute_pair_voronoi_face = [&](size_t seed_i,
+                                                  size_t seed_j,
+                                                  std::vector<Point_3>& out_face) -> bool {
+                out_face.clear();
+                if (seed_i >= num_seeds || seed_j >= num_seeds) return false;
+                if (!seed_pos_valid[seed_i] || !seed_pos_valid[seed_j]) return false;
+
+                const Vec3 a = seed_pos[seed_i];
+                const Vec3 b = seed_pos[seed_j];
+                Vec3 ab = sub(b, a);
+                const double ab_len = norm(ab);
+                if (ab_len <= 1e-14 * bbox_diag) return false;
+
+                Vec3 n = mul(ab, 1.0 / ab_len);
+                Vec3 mid = mul(add(a, b), 0.5);
+
+                // Build an orthonormal basis on the bisector plane.
+                Vec3 tmp = (std::abs(n.x) < 0.85) ? Vec3{1.0, 0.0, 0.0} : Vec3{0.0, 1.0, 0.0};
+                Vec3 u = normalize(cross(n, tmp));
+                if (norm2(u) <= 1e-24) {
+                    tmp = Vec3{0.0, 0.0, 1.0};
+                    u = normalize(cross(n, tmp));
+                }
+                Vec3 v = normalize(cross(n, u));
+
+                // Large initial square on Π_ij.  If the true face is unbounded,
+                // this produces a bounded diagnostic clipping; for the intended
+                // reconstruction pairs the face should normally be bounded by other seeds.
+                const double R = initial_half_size;
+                std::vector<Vec3> poly;
+                poly.reserve(16);
+                poly.push_back(add(mid, add(mul(u, -R), mul(v, -R))));
+                poly.push_back(add(mid, add(mul(u,  R), mul(v, -R))));
+                poly.push_back(add(mid, add(mul(u,  R), mul(v,  R))));
+                poly.push_back(add(mid, add(mul(u, -R), mul(v,  R))));
+
+                // Clip by all other reconstruction seeds.
+                for (size_t sid_k : reconstruction_seed_ids) {
+                    if (sid_k == seed_i || sid_k == seed_j) continue;
+                    poly = clip_polygon_by_seed_halfspace(poly, a, seed_pos[sid_k]);
+                    if (poly.size() < 3) return false;
+                }
+
+                poly = cleanup_polygon_points(poly);
+                if (poly.size() < 3) return false;
+
+                out_face.reserve(poly.size());
+                for (const Vec3& p : poly) {
+                    out_face.emplace_back(p.x, p.y, p.z);
+                }
+                return true;
+            };
+
+            std::vector<std::vector<Point_3>> direct_facets;
             std::vector<std::array<size_t, 8>> facet_sources;
-            bool did_export_single = false;
+            direct_facets.reserve(all_seed_pairs.size());
+            facet_sources.reserve(all_seed_pairs.size());
 
-            for (auto eit = dt.finite_edges_begin(); eit != dt.finite_edges_end(); ++eit) {
-                total_edges++;
+            size_t strict_pair_total = 0;
+            size_t reciprocal_pair_total = 0;
+            size_t direct_faces_exported = 0;
+            size_t direct_faces_empty = 0;
+            size_t invalid_pair_count = 0;
 
-                Cell_handle c = eit->first;
-                int i = eit->second;
-                int j = eit->third;
+            for (const auto& seed_pair : all_seed_pairs) {
+                size_t seed_idx1 = seed_pair.first;
+                size_t seed_idx2 = seed_pair.second;
+                strict_pair_total++;
 
-                Vertex_handle v1 = c->vertex(i);
-                Vertex_handle v2 = c->vertex(j);
-
-                auto it1 = vertex_labels.find(v1);
-                auto it2 = vertex_labels.find(v2);
-                if (it1 == vertex_labels.end() || it2 == vertex_labels.end()) {
-                    no_label_edges++;
+                if (seed_idx1 >= num_seeds || seed_idx2 >= num_seeds) {
+                    invalid_pair_count++;
+                    continue;
+                }
+                if (!seeds->tree_point_is_active(seed_idx1) || !seeds->tree_point_is_active(seed_idx2)) {
+                    invalid_pair_count++;
                     continue;
                 }
 
-                int label1 = it1->second;
-                int label2 = it2->second;
+                size_t* attrib1 = seeds->get_tree_point_attrib(seed_idx1);
+                size_t* attrib2 = seeds->get_tree_point_attrib(seed_idx2);
 
-                if (label1 != label2) {
-                    size_t seed_idx1 = v1->info();
-                    size_t seed_idx2 = v2->info();
-                    size_t* attrib1 = seeds->get_tree_point_attrib(seed_idx1);
-                    size_t* attrib2 = seeds->get_tree_point_attrib(seed_idx2);
-                    boundary_edges_count++;
-                    bool is_pair_connection =
-                        strict_seed_pair_keys.count(pair_key(seed_idx1, seed_idx2)) > 0;
-
-                    std::vector<Point_3> facet_vertices;
-                    Delaunay::Cell_circulator cc = dt.incident_cells(*eit);
-                    Delaunay::Cell_circulator done = cc;
-                    if (cc == nullptr) continue;
-
-                    do {
-                        if (!dt.is_infinite(cc)) {
-                            Point_3 center = dt.dual(cc);
-                            facet_vertices.push_back(center);
-                        }
-                        ++cc;
-                    } while (cc != done);
-
-                    if (facet_vertices.size() >= 3) {
-                        facets.push_back(facet_vertices);
-                        facet_sources.push_back({
-                            seed_idx1, seed_idx2,
-                            attrib1[2], attrib1[3], attrib1[4],
-                            attrib2[2], attrib2[3], attrib2[4]
-                        });
-                        if (is_pair_connection) {
-                            boundary_pair_edges++;
-                        }
-                        else {
-                            boundary_non_pair_edges++;
-                        }
-                        // if (!did_export_single) {
-                        //     export_single_voronoi_polygon(v1, v2, "single_voronoi_polygon.obj");
-                        //     did_export_single = true;
-                        // }
-                    }
+                if (attrib1[5] == attrib2[5]) {
+                    invalid_pair_count++;
+                    continue;
                 }
-                else {
-                    if (label1 == 1) inner_edges++;
-                    else if (label1 == 0) outer_edges++;
+
+                bool is_reciprocal_pair =
+                    attrib1[1] == seed_idx2 && attrib2[1] == seed_idx1;
+                if (!is_reciprocal_pair) {
+                    invalid_pair_count++;
+                    continue;
                 }
+                reciprocal_pair_total++;
+
+                std::vector<Point_3> face;
+                if (!compute_pair_voronoi_face(seed_idx1, seed_idx2, face)) {
+                    direct_faces_empty++;
+                    continue;
+                }
+
+                direct_facets.push_back(std::move(face));
+                facet_sources.push_back({
+                    seed_idx1, seed_idx2,
+                    attrib1[2], attrib1[3], attrib1[4],
+                    attrib2[2], attrib2[3], attrib2[4]
+                });
+                direct_faces_exported++;
             }
 
-            write_voronoi_facets_to_obj("voronoi.obj", facets);
-            write_voronoi_facets_to_obj_dedup("voronoi_dedup.obj", facets, &facet_sources, "voronoi_dedup_map.csv");
-            // write_voronoi_facets_triangulated_obj("voronoi_dedup_triangulated.obj", facets, &facet_sources, "voronoi_dedup_triangulated_map.csv");
-            std::cout << "  * Found " << facets.size() << " Voronoi facets for seed pairs" << std::endl;
+            write_voronoi_facets_original_obj(
+                output_filename,
+                direct_facets,
+                &facet_sources,
+                "voronoi_direct_pair_map.csv"
+            );
+
+            // Keep the old dedup pipeline available on the directly computed faces.
+            write_voronoi_facets_to_obj_dedup(
+                "voronoi_dedup.obj",
+                direct_facets,
+                &facet_sources,
+                "voronoi_dedup_map.csv",
+                1.05e-5,
+                170.0,
+                false
+            );
+
             {
                 std::ofstream stats_out("vorocrust_surface_stats.csv");
                 if (stats_out.is_open()) {
-                    stats_out << "total_seed_pairs,reconstruction_seed_count,total_delaunay_edges,"
-                              << "interface_edges,strict_pair_facets,non_pair_interface_facets,"
-                              << "exported_interface_facets\n";
-                    stats_out << all_seed_pairs.size() << ','
-                              << dt.number_of_vertices() << ','
-                              << total_edges << ','
-                              << boundary_edges_count << ','
-                              << boundary_pair_edges << ','
-                              << boundary_non_pair_edges << ','
-                              << facets.size() << '\n';
+                    stats_out << "mode,total_seed_pairs,reciprocal_strict_pairs,reconstruction_seed_count,"
+                              << "direct_faces_exported,direct_faces_empty,invalid_pairs,"
+                              << "bbox_diag,initial_half_size,clip_tol,cleanup_eps\n";
+                    stats_out << "direct_pair_cell_intersection," 
+                              << strict_pair_total << ','
+                              << reciprocal_pair_total << ','
+                              << reconstruction_seed_ids.size() << ','
+                              << direct_faces_exported << ','
+                              << direct_faces_empty << ','
+                              << invalid_pair_count << ','
+                              << bbox_diag << ','
+                              << initial_half_size << ','
+                              << clip_tol << ','
+                              << cleanup_eps << '\n';
                 }
             }
 
-            /*
-            {
-                std::map<std::tuple<double, double, double>, size_t> vertex_map;
-                std::vector<Point_3> unique_vertices;
-                std::vector<std::vector<size_t>> face_indices;
-
-                auto get_vertex_index = [&](const Point_3& p) -> size_t {
-                    double x = std::round(CGAL::to_double(p.x()) * 1e10) / 1e10;
-                    double y = std::round(CGAL::to_double(p.y()) * 1e10) / 1e10;
-                    double z = std::round(CGAL::to_double(p.z()) * 1e10) / 1e10;
-                    auto key = std::make_tuple(x, y, z);
-
-                    auto it = vertex_map.find(key);
-                    if (it != vertex_map.end()) return it->second;
-                    size_t idx = unique_vertices.size();
-                    vertex_map[key] = idx;
-                    unique_vertices.push_back(p);
-                    return idx;
-                };
-
-                for (const auto& facet : facets) {
-                    if (facet.size() < 3) continue;
-
-                    std::vector<size_t> indices;
-                    for (const auto& pt : facet) indices.push_back(get_vertex_index(pt));
-
-                    Point_3 centroid = CGAL::ORIGIN;
-                    for (const auto& pt : facet) centroid = centroid + (pt - CGAL::ORIGIN);
-                    double s = static_cast<double>(facet.size());
-                    centroid = Point_3(centroid.x() / s, centroid.y() / s, centroid.z() / s);
-                    size_t centroid_idx = get_vertex_index(centroid);
-
-                    for (size_t i = 0; i < indices.size(); i++) {
-                        size_t idx0 = indices[i];
-                        size_t idx1 = indices[(i + 1) % indices.size()];
-                        if (idx0 == idx1 || idx0 == centroid_idx || idx1 == centroid_idx) continue;
-                        face_indices.push_back({ centroid_idx, idx0, idx1 });
-                    }
-                }
-
-                for (const auto& v : unique_vertices) {
-                    out << "v " << std::setprecision(16)
-                        << CGAL::to_double(v.x()) << " "
-                        << CGAL::to_double(v.y()) << " "
-                        << CGAL::to_double(v.z()) << std::endl;
-                }
-                for (const auto& face : face_indices) {
-                    out << "f " << (face[0] + 1) << " " << (face[1] + 1) << " " << (face[2] + 1) << std::endl;
-                }
-
-                std::cout << "  * Total vertices: " << unique_vertices.size() << ", triangles: " << face_indices.size() << std::endl;
-            }
-            */
-
-        std::cout << "\n--- Edge Classification ---" << std::endl;
-        std::cout << "Total Delaunay edges: " << total_edges << std::endl;
-        std::cout << "|- Boundary edges (1-2): " << boundary_edges_count
-            << " (" << (100.0 * boundary_edges_count / std::max(1, total_edges)) << "%)" << std::endl;
-        std::cout << "|- Strict-pair interface facets: " << boundary_pair_edges
-            << " (" << (100.0 * boundary_pair_edges / std::max(1, total_edges)) << "%)" << std::endl;
-        std::cout << "|- Non-pair interface facets kept (stair-error candidates): " << boundary_non_pair_edges
-            << std::endl;
-        std::cout << "|- Inner edges (1-1): " << inner_edges
-            << " (" << (100.0 * inner_edges / std::max(1, total_edges)) << "%)" << std::endl;
-        std::cout << "|- Outer edges (2-2): " << outer_edges
-                << " (" << (100.0 * outer_edges / std::max(1, total_edges)) << "%)" << std::endl;
-            std::cout << "'- No label edges: " << no_label_edges << std::endl;
+            std::cout << "  * Direct strict-pair Voronoi cell intersection exported" << std::endl;
+            std::cout << "    reconstruction seeds      = " << reconstruction_seed_ids.size() << std::endl;
+            std::cout << "    strict pairs total        = " << strict_pair_total << std::endl;
+            std::cout << "    reciprocal strict pairs   = " << reciprocal_pair_total << std::endl;
+            std::cout << "    exported polygon faces    = " << direct_faces_exported << std::endl;
+            std::cout << "    empty / clipped-out faces = " << direct_faces_empty << std::endl;
+            std::cout << "    invalid pairs             = " << invalid_pair_count << std::endl;
+            std::cout << "    bbox_diag                 = " << bbox_diag << std::endl;
         };
 
         auto exportDelaunayBoundarySurface = [&](const std::string& filename) {
