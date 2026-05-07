@@ -975,8 +975,8 @@ void Generator::generate_surface_mesh(MeshingTree* seeds, MeshingTree* spheres, 
     Delaunay dt;
     std::vector<Vertex_handle> vertex_handles(num_seeds);
     std::vector<std::pair<size_t, size_t>> all_seed_pairs;
-    std::set<std::pair<size_t, size_t>> sampled_seed_pair_keys;
-    std::vector<char> sampled_seed_indices(num_seeds, false);
+    std::set<std::pair<size_t, size_t>> strict_seed_pair_keys;
+    std::vector<char> reconstruction_seed_indices(num_seeds, false);
 
     auto pair_key = [](size_t a, size_t b) {
         return (a < b) ? std::make_pair(a, b) : std::make_pair(b, a);
@@ -1000,23 +1000,17 @@ void Generator::generate_surface_mesh(MeshingTree* seeds, MeshingTree* spheres, 
             }
         }
 
-        std::random_device rd;
-        std::mt19937 rng(rd());
-        std::shuffle(all_seed_pairs.begin(), all_seed_pairs.end(), rng);
-
-        size_t num_sampled_pairs = (all_seed_pairs.size() + 1) / 2;
-        for (size_t i = 0; i < num_sampled_pairs; i++) {
-            sampled_seed_pair_keys.insert(all_seed_pairs[i]);
-            sampled_seed_indices[all_seed_pairs[i].first] = true;
-            sampled_seed_indices[all_seed_pairs[i].second] = true;
+        for (const auto& seed_pair : all_seed_pairs) {
+            strict_seed_pair_keys.insert(seed_pair);
+            reconstruction_seed_indices[seed_pair.first] = true;
+            reconstruction_seed_indices[seed_pair.second] = true;
         }
 
-        std::cout << "  * Randomly selected " << sampled_seed_pair_keys.size()
-                  << " / " << all_seed_pairs.size()
+        std::cout << "  * Selected all " << all_seed_pairs.size()
                   << " seed pairs for Voronoi reconstruction" << std::endl;
 
-        if (sampled_seed_pair_keys.empty()) {
-            std::cerr << "Error: No seed pairs selected for reconstruction." << std::endl;
+        if (all_seed_pairs.empty()) {
+            std::cerr << "Error: No seed pairs available for reconstruction." << std::endl;
             return;
         }
     }
@@ -1026,7 +1020,7 @@ void Generator::generate_surface_mesh(MeshingTree* seeds, MeshingTree* spheres, 
         std::fill(vertex_handles.begin(), vertex_handles.end(), Vertex_handle());
         for (size_t i = 0; i < num_seeds; i++) {
             if (!seeds->tree_point_is_active(i)) continue;
-            if (!sampled_seed_indices[i]) continue;
+            if (!reconstruction_seed_indices[i]) continue;
             double* pt = seeds->get_tree_point(i);
             Vertex_handle vh = dt.insert(Point_3(pt[0], pt[1], pt[2]));
             vh->info() = i;
@@ -1271,18 +1265,27 @@ void Generator::generate_surface_mesh(MeshingTree* seeds, MeshingTree* spheres, 
         size_t seed_idx2 = v2->info();
         
         // Check if this edge connects a seed pair (inside/outside)
+       // Check if this Delaunay edge connects an original paired seed pair.
         size_t* attrib1 = seeds->get_tree_point_attrib(seed_idx1);
         size_t* attrib2 = seeds->get_tree_point_attrib(seed_idx2);
-        
-        // attrib[1] is the pair seed index
-        // 杩欓噷浣跨敤涔嬪墠鐢熸垚鐨勯厤瀵逛俊鎭紝鎴栬€呭彲浠ユ敼鐢ㄥ尯鍩?ID (attrib[5]) 鍒ゆ柇: 
-        //bool is_interface = (attrib1[5] != attrib2[5]);
-        bool is_interface = (attrib1[5] != attrib2[5]) &&
-            sampled_seed_pair_keys.count(pair_key(seed_idx1, seed_idx2)) > 0;
-        if (!is_interface) continue;
-      //  if (!is_pair) continue;
-        int label1 = seed_idx1;
-        int label2 = seed_idx2;
+
+        // 1. 必须 inside / outside 标签不同
+        if (attrib1[5] == attrib2[5]) continue;
+
+        // 2. 必须是原始成对 seed
+        auto strict_key = pair_key(seed_idx1, seed_idx2);
+        bool is_strict_pair =
+            strict_seed_pair_keys.find(strict_key) != strict_seed_pair_keys.end();
+
+        if (!is_strict_pair) continue;
+
+        // 3. 可选但建议：强制检查 attrib[1] 是否互相指向
+        // 如果你的 seed pair 一定是严格互指的，这个判断可以保留，能防止脏数据。
+        bool is_reciprocal_pair =
+            attrib1[1] == seed_idx2 &&
+            attrib2[1] == seed_idx1;
+
+        if (!is_reciprocal_pair) continue;
         // This edge connects a seed pair - extract the dual Voronoi facet
         // The Voronoi facet is the convex polygon formed by circumcenters of 
         // cells incident to this edge
@@ -1848,13 +1851,9 @@ void Generator::generate_surface_mesh(MeshingTree* seeds, MeshingTree* spheres, 
                     size_t seed_idx2 = v2->info();
                     size_t* attrib1 = seeds->get_tree_point_attrib(seed_idx1);
                     size_t* attrib2 = seeds->get_tree_point_attrib(seed_idx2);
-                    bool is_pair_connection =
-                        sampled_seed_pair_keys.count(pair_key(seed_idx1, seed_idx2)) > 0;
                     boundary_edges_count++;
-                    if (!is_pair_connection) {
-                        boundary_non_pair_edges++;
-                        continue;
-                    }
+                    bool is_pair_connection =
+                        strict_seed_pair_keys.count(pair_key(seed_idx1, seed_idx2)) > 0;
 
                     std::vector<Point_3> facet_vertices;
                     Delaunay::Cell_circulator cc = dt.incident_cells(*eit);
@@ -1876,7 +1875,12 @@ void Generator::generate_surface_mesh(MeshingTree* seeds, MeshingTree* spheres, 
                             attrib1[2], attrib1[3], attrib1[4],
                             attrib2[2], attrib2[3], attrib2[4]
                         });
-                        boundary_pair_edges++;
+                        if (is_pair_connection) {
+                            boundary_pair_edges++;
+                        }
+                        else {
+                            boundary_non_pair_edges++;
+                        }
                         // if (!did_export_single) {
                         //     export_single_voronoi_polygon(v1, v2, "single_voronoi_polygon.obj");
                         //     did_export_single = true;
@@ -1893,6 +1897,21 @@ void Generator::generate_surface_mesh(MeshingTree* seeds, MeshingTree* spheres, 
             write_voronoi_facets_to_obj_dedup("voronoi_dedup.obj", facets, &facet_sources, "voronoi_dedup_map.csv");
             // write_voronoi_facets_triangulated_obj("voronoi_dedup_triangulated.obj", facets, &facet_sources, "voronoi_dedup_triangulated_map.csv");
             std::cout << "  * Found " << facets.size() << " Voronoi facets for seed pairs" << std::endl;
+            {
+                std::ofstream stats_out("vorocrust_surface_stats.csv");
+                if (stats_out.is_open()) {
+                    stats_out << "total_seed_pairs,reconstruction_seed_count,total_delaunay_edges,"
+                              << "interface_edges,strict_pair_facets,non_pair_interface_facets,"
+                              << "exported_interface_facets\n";
+                    stats_out << all_seed_pairs.size() << ','
+                              << dt.number_of_vertices() << ','
+                              << total_edges << ','
+                              << boundary_edges_count << ','
+                              << boundary_pair_edges << ','
+                              << boundary_non_pair_edges << ','
+                              << facets.size() << '\n';
+                }
+            }
 
             /*
             {
@@ -1952,9 +1971,9 @@ void Generator::generate_surface_mesh(MeshingTree* seeds, MeshingTree* spheres, 
         std::cout << "Total Delaunay edges: " << total_edges << std::endl;
         std::cout << "|- Boundary edges (1-2): " << boundary_edges_count
             << " (" << (100.0 * boundary_edges_count / std::max(1, total_edges)) << "%)" << std::endl;
-        std::cout << "|- Pair boundary edges (1-2) preserved: " << boundary_pair_edges
+        std::cout << "|- Strict-pair interface facets: " << boundary_pair_edges
             << " (" << (100.0 * boundary_pair_edges / std::max(1, total_edges)) << "%)" << std::endl;
-        std::cout << "|- Boundary edges (1-2) skipped (no pair link): " << boundary_non_pair_edges
+        std::cout << "|- Non-pair interface facets kept (stair-error candidates): " << boundary_non_pair_edges
             << std::endl;
         std::cout << "|- Inner edges (1-1): " << inner_edges
             << " (" << (100.0 * inner_edges / std::max(1, total_edges)) << "%)" << std::endl;

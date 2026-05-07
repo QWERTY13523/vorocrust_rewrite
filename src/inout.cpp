@@ -1932,14 +1932,26 @@ bool Inout::benchmark_mesh_inside_outside(
     (void)seed_pair_csv;
     (void)num_tests;
     (void)csv_output;
-    std::cerr << "Error: --inout-benchmark requires USE_CGAL=ON." << std::endl;
+    std::cerr << "Error: --inout-benchmark requires USE_CGAL=ON because CGAL is used as the reference inside/outside classifier." << std::endl;
     return false;
 #else
+    // Reconstruction-only benchmark:
+    //   - GT:       CGAL::Side_of_triangle_mesh on the reconstructed mesh
+    //   - Ours:     nearest labeled seed
+    //   - Baseline: libigl fast winding number on the reconstructed mesh
+    //   - Baseline: Embree parity ray test on the reconstructed mesh, when USE_EMBREE=ON
+    // The original/reference mesh argument is intentionally ignored to avoid
+    // extra loading, alignment, FWN, CGAL, and Embree work on the original mesh.
+    (void)reference_mesh_obj;
+
     if (num_tests == 0) {
         std::cerr << "Error: num_tests must be greater than 0." << std::endl;
         return false;
     }
 
+    // ============================================================
+    // 1. Load labeled seed points
+    // ============================================================
     std::ifstream seed_file(seed_pair_csv);
     if (!seed_file.is_open()) {
         std::cerr << "Error: cannot open seed pair csv: " << seed_pair_csv << std::endl;
@@ -1956,11 +1968,30 @@ bool Inout::benchmark_mesh_inside_outside(
             return false;
         }
     }
+
     if (seed_points.empty()) {
         std::cerr << "Error: no valid seed points parsed from " << seed_pair_csv << std::endl;
         return false;
     }
 
+    if (!saw_explicit_region) {
+        if ((seed_points.size() % 2) != 0) {
+            std::cerr << "Error: seed csv has no explicit inside/outside label and contains an odd number of seeds. "
+                      << "Provide either a seed-pair CSV or a fifth region column."
+                      << std::endl;
+            return false;
+        }
+        std::cerr << "Warning: seed csv has no explicit region column; assuming alternating [inside, outside] seeds."
+                  << std::endl;
+        for (std::size_t i = 0; i < seed_points.size(); ++i) {
+            seed_points[i].region = (i % 2 == 0) ? 1 : 0;
+        }
+        saw_explicit_region = true;
+    }
+
+    // ============================================================
+    // 2. Load reconstructed mesh only
+    // ============================================================
     Eigen::MatrixXd reconstructed_vertices;
     Eigen::MatrixXi reconstructed_faces;
     if (!load_obj_as_triangles(reconstructed_mesh_obj, reconstructed_vertices, reconstructed_faces) ||
@@ -1972,101 +2003,38 @@ bool Inout::benchmark_mesh_inside_outside(
         return false;
     }
 
-    Eigen::MatrixXd reference_vertices;
-    Eigen::MatrixXi reference_faces;
-    if (!load_obj_as_triangles(reference_mesh_obj, reference_vertices, reference_faces) ||
-        reference_vertices.rows() == 0 ||
-        reference_faces.rows() == 0 ||
-        reference_faces.cols() != 3) {
-        std::cerr << "Error: cannot read triangular reference mesh: "
-                  << reference_mesh_obj << std::endl;
-        return false;
-    }
+    orient_faces_outward(reconstructed_vertices, reconstructed_faces);
 
-    if (!saw_explicit_region) {
-        if ((seed_points.size() % 2) != 0) {
-            std::cerr << "Error: seed csv has no explicit inside/outside label and contains an odd number of seeds. "
-                      << "For inside/outside accuracy, provide either a seed-pair CSV or a fifth region column."
-                      << std::endl;
-            return false;
-        }
-        std::cerr << "Warning: seed csv has no explicit region column; assuming alternating row pairs "
-                  << "[inside, outside], matching columns inside_x inside_y inside_z outside_x outside_y outside_z."
-                  << std::endl;
-        for (std::size_t i = 0; i < seed_points.size(); ++i) {
-            seed_points[i].region = (i % 2 == 0) ? 1 : 0;
-        }
-        saw_explicit_region = true;
-    }
-
-    // Move the original data mesh into the same position as the reconstructed
-    // dedup mesh before the inside/outside test.  The seed coordinates are
-    // produced together with the reconstructed model, so all inputs then receive
-    // the reconstructed/dedup transform.
-    BBox3d reference_bbox;
-    reference_bbox.include_vertices(reference_vertices);
-    BBox3d reconstructed_bbox;
-    reconstructed_bbox.include_vertices(reconstructed_vertices);
-    if (!reference_bbox.valid() || !reconstructed_bbox.valid()) {
-        std::cerr << "Error: cannot compute valid mesh bbox for inout alignment." << std::endl;
-        return false;
-    }
-    const Eigen::Vector3d reference_center(
-        reference_bbox.center_x(),
-        reference_bbox.center_y(),
-        reference_bbox.center_z()
-    );
-    const Eigen::Vector3d reconstructed_center(
-        reconstructed_bbox.center_x(),
-        reconstructed_bbox.center_y(),
-        reconstructed_bbox.center_z()
-    );
-    const Eigen::Vector3d reference_to_dedup_offset = reconstructed_center - reference_center;
-    translate_vertices(reference_vertices, reference_to_dedup_offset);
-
+    // Normalize reconstruction and seeds into the same canonical space.
     const SimilarityTransform3d reconstructed_transform = make_unit_bbox_transform(reconstructed_vertices);
-    apply_transform_to_vertices(reference_vertices, reconstructed_transform);
     apply_transform_to_vertices(reconstructed_vertices, reconstructed_transform);
     apply_transform_to_seeds(seed_points, reconstructed_transform);
 
+    BBox3d reconstructed_bbox;
+    reconstructed_bbox.include_vertices(reconstructed_vertices);
+    if (!reconstructed_bbox.valid()) {
+        std::cerr << "Error: cannot compute valid reconstructed mesh bbox." << std::endl;
+        return false;
+    }
+
     std::cout << std::fixed << std::setprecision(9)
-              << "[Align] original/reference bbox center=(" << reference_center.x() << ", "
-              << reference_center.y() << ", " << reference_center.z() << ")"
-              << ", dedup/reconstruction bbox center=(" << reconstructed_center.x() << ", "
-              << reconstructed_center.y() << ", " << reconstructed_center.z() << ")"
-              << ", original_translation=(" << reference_to_dedup_offset.x() << ", "
-              << reference_to_dedup_offset.y() << ", " << reference_to_dedup_offset.z() << ")"
+              << "[Normalize] reconstruction/seed center=("
+              << reconstructed_transform.cx << ", "
+              << reconstructed_transform.cy << ", "
+              << reconstructed_transform.cz << ")"
+              << ", scale=" << reconstructed_transform.inv_scale
               << std::endl;
-    std::cout << std::fixed << std::setprecision(9)
-              << "[Normalize] aligned original/reconstruction/seed center=(" << reconstructed_transform.cx << ", "
-              << reconstructed_transform.cy << ", " << reconstructed_transform.cz << ")"
-              << ", scale=" << reconstructed_transform.inv_scale << std::endl;
 
-    orient_faces_outward(reconstructed_vertices, reconstructed_faces);
-    orient_faces_outward(reference_vertices, reference_faces);
+    // ============================================================
+    // 3. Generate query points in bbox(reconstruction union seeds) + padding
+    // ============================================================
+    double min_x = reconstructed_bbox.min_x;
+    double min_y = reconstructed_bbox.min_y;
+    double min_z = reconstructed_bbox.min_z;
+    double max_x = reconstructed_bbox.max_x;
+    double max_y = reconstructed_bbox.max_y;
+    double max_z = reconstructed_bbox.max_z;
 
-    double min_x = std::numeric_limits<double>::infinity();
-    double min_y = std::numeric_limits<double>::infinity();
-    double min_z = std::numeric_limits<double>::infinity();
-    double max_x = -std::numeric_limits<double>::infinity();
-    double max_y = -std::numeric_limits<double>::infinity();
-    double max_z = -std::numeric_limits<double>::infinity();
-
-    const auto include_vertices_in_bbox = [&](const Eigen::MatrixXd& vertices) {
-        for (Eigen::Index i = 0; i < vertices.rows(); ++i) {
-            min_x = std::min(min_x, vertices(i, 0));
-            min_y = std::min(min_y, vertices(i, 1));
-            min_z = std::min(min_z, vertices(i, 2));
-            max_x = std::max(max_x, vertices(i, 0));
-            max_y = std::max(max_y, vertices(i, 1));
-            max_z = std::max(max_z, vertices(i, 2));
-        }
-    };
-    // Generate query points in the reconstruction/seed canonical space.  The
-    // reconstructed GT is the consistency target for the seed Voronoi classifier;
-    // using the original mesh bbox here can sample a different space and unfairly
-    // dilute the reconstruction accuracy.
-    include_vertices_in_bbox(reconstructed_vertices);
     for (const auto& p : seed_points) {
         min_x = std::min(min_x, p.x);
         min_y = std::min(min_y, p.y);
@@ -2090,10 +2058,11 @@ bool Inout::benchmark_mesh_inside_outside(
     std::uniform_real_distribution<double> dist_y(min_y, max_y);
     std::uniform_real_distribution<double> dist_z(min_z, max_z);
 
-    Eigen::MatrixXd query_points(num_tests, 3);
+    Eigen::MatrixXd query_points(static_cast<Eigen::Index>(num_tests), 3);
     std::vector<double> query_x(num_tests);
     std::vector<double> query_y(num_tests);
     std::vector<double> query_z(num_tests);
+
     for (std::size_t i = 0; i < num_tests; ++i) {
         const double x = dist_x(gen);
         const double y = dist_y(gen);
@@ -2108,47 +2077,80 @@ bool Inout::benchmark_mesh_inside_outside(
         query_points(static_cast<Eigen::Index>(i), 2) = z;
     }
 
-    std::cout << "[InOut] reconstructed=" << reconstructed_mesh_obj
-              << " (V=" << reconstructed_vertices.rows()
-              << ", F=" << reconstructed_faces.rows() << ")" << std::endl;
-    std::cout << "[InOut] reference=" << reference_mesh_obj
-              << " (V=" << reference_vertices.rows()
-              << ", F=" << reference_faces.rows() << ")" << std::endl;
-    std::cout << "[InOut] seed_pairs=" << seed_pair_csv
-              << " (seeds=" << seed_points.size() << ")" << std::endl;
-    std::cout << "[InOut] seed-pair convention: inside=(cols 0..2), outside=(cols 3..5); "
-              << "face columns 6..14 are ignored by nearest-seed query" << std::endl;
-    std::cout << "[InOut] num_tests=" << num_tests << std::endl;
+    std::cout << std::fixed << std::setprecision(6)
+              << "[InOut Reconstruction Only]"
+              << " reconstructed=" << reconstructed_mesh_obj
+              << ", V=" << reconstructed_vertices.rows()
+              << ", F=" << reconstructed_faces.rows()
+              << ", seed_csv=" << seed_pair_csv
+              << ", seeds=" << seed_points.size()
+              << ", total_tests=" << num_tests
+              << ", query_bbox=[("
+              << min_x << ", " << min_y << ", " << min_z << "), ("
+              << max_x << ", " << max_y << ", " << max_z << ")]"
+              << std::endl;
 
-    const auto original_fast_winding_start = std::chrono::steady_clock::now();
-    Eigen::VectorXd original_fast_winding_numbers;
-    igl::fast_winding_number(reference_vertices, reference_faces, query_points, original_fast_winding_numbers);
-    const auto original_fast_winding_end = std::chrono::steady_clock::now();
-    const auto original_fast_winding_ns =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            original_fast_winding_end - original_fast_winding_start
-        );
-
-    const auto reconstructed_fast_winding_start = std::chrono::steady_clock::now();
-    Eigen::VectorXd reconstructed_fast_winding_numbers;
-    igl::fast_winding_number(
-        reconstructed_vertices,
-        reconstructed_faces,
-        query_points,
-        reconstructed_fast_winding_numbers
+    // ============================================================
+    // 4. Ours: nearest labeled seed
+    // ============================================================
+    const auto ours_build_start = std::chrono::steady_clock::now();
+    FastSeedIndex seed_index(seed_points);
+    const auto ours_build_end = std::chrono::steady_clock::now();
+    const auto ours_build_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        ours_build_end - ours_build_start
     );
-    const auto reconstructed_fast_winding_end = std::chrono::steady_clock::now();
-    const auto reconstructed_fast_winding_ns =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            reconstructed_fast_winding_end - reconstructed_fast_winding_start
+
+    std::vector<unsigned char> ours_inside(num_tests, 0);
+    std::vector<std::size_t> ours_nearest_indices(num_tests, 0);
+    double ours_dist2_checksum = 0.0;
+    std::size_t ours_index_checksum = 1469598103934665603ull;
+
+    const auto ours_query_start = std::chrono::steady_clock::now();
+    for (std::size_t i = 0; i < num_tests; ++i) {
+        unsigned char region = 0;
+        double dist2 = 0.0;
+        const std::size_t nearest_idx = seed_index.nearest_index_and_region(
+            query_x[i], query_y[i], query_z[i], region, &dist2
         );
+        if (nearest_idx >= seed_points.size()) {
+            std::cerr << "Error: nearest-seed query failed at test " << i << std::endl;
+            return false;
+        }
+        ours_nearest_indices[i] = nearest_idx;
+        ours_inside[i] = static_cast<unsigned char>(region != 0);
+        ours_dist2_checksum += dist2;
+        ours_index_checksum ^= nearest_idx +
+            0x9e3779b97f4a7c15ull +
+            (ours_index_checksum << 6) +
+            (ours_index_checksum >> 2);
+    }
+    const auto ours_query_end = std::chrono::steady_clock::now();
+    const auto ours_query_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        ours_query_end - ours_query_start
+    );
 
-    const auto method_build_start = std::chrono::steady_clock::now();
-    const FastSeedIndex seed_index(seed_points);
-    const auto method_build_end = std::chrono::steady_clock::now();
-    const auto method_build_ns =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(method_build_end - method_build_start);
+    // ============================================================
+    // 5. FWN baseline on reconstructed mesh
+    // ============================================================
+    const auto fwn_start = std::chrono::steady_clock::now();
+    Eigen::VectorXd fwn_numbers;
+    igl::fast_winding_number(reconstructed_vertices, reconstructed_faces, query_points, fwn_numbers);
+    const auto fwn_end = std::chrono::steady_clock::now();
+    const auto fwn_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(fwn_end - fwn_start);
 
+    std::vector<unsigned char> fwn_inside(num_tests, 0);
+    std::size_t fwn_boundary_like = 0;
+    for (std::size_t i = 0; i < num_tests; ++i) {
+        const double w = fwn_numbers(static_cast<Eigen::Index>(i));
+        if (std::abs(std::abs(w) - 0.5) <= 1e-8) {
+            fwn_boundary_like++;
+        }
+        fwn_inside[i] = static_cast<unsigned char>(std::abs(w) > 0.5);
+    }
+
+    // ============================================================
+    // 6. CGAL GT on reconstructed mesh
+    // ============================================================
     using CgalKernel = CGAL::Simple_cartesian<double>;
     using CgalPoint = CgalKernel::Point_3;
     using CgalMesh = CGAL::Surface_mesh<CgalPoint>;
@@ -2157,95 +2159,7 @@ bool Inout::benchmark_mesh_inside_outside(
     using CgalTree = CGAL::AABB_tree<CgalTraits>;
     using CgalSide = CGAL::Side_of_triangle_mesh<CgalMesh, CgalKernel, CGAL::Default, CgalTree>;
 
-    auto run_cgal_queries = [&](const Eigen::MatrixXd& vertices,
-                                const Eigen::MatrixXi& faces,
-                                std::vector<CGAL::Bounded_side>& results,
-                                std::size_t& boundary_count,
-                                std::size_t& skipped_faces,
-                                std::chrono::nanoseconds& build_ns,
-                                std::chrono::nanoseconds& query_ns) {
-        CgalMesh mesh;
-        std::vector<CgalMesh::Vertex_index> mesh_vertices;
-        mesh_vertices.reserve(static_cast<std::size_t>(vertices.rows()));
-        for (Eigen::Index i = 0; i < vertices.rows(); ++i) {
-            mesh_vertices.push_back(mesh.add_vertex(CgalPoint(
-                vertices(i, 0),
-                vertices(i, 1),
-                vertices(i, 2)
-            )));
-        }
-        skipped_faces = 0;
-        for (Eigen::Index i = 0; i < faces.rows(); ++i) {
-            const CgalMesh::Face_index face = mesh.add_face(
-                mesh_vertices[static_cast<std::size_t>(faces(i, 0))],
-                mesh_vertices[static_cast<std::size_t>(faces(i, 1))],
-                mesh_vertices[static_cast<std::size_t>(faces(i, 2))]
-            );
-            if (face == CgalMesh::null_face()) {
-                skipped_faces++;
-            }
-        }
-
-        const auto build_start = std::chrono::steady_clock::now();
-        CgalTree tree(CGAL::faces(mesh).first, CGAL::faces(mesh).second, mesh);
-        tree.build();
-        CgalSide side(tree);
-        const auto build_end = std::chrono::steady_clock::now();
-        build_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(build_end - build_start);
-
-        boundary_count = 0;
-        const auto query_start = std::chrono::steady_clock::now();
-        for (std::size_t i = 0; i < num_tests; ++i) {
-            const Eigen::Index row = static_cast<Eigen::Index>(i);
-            const CGAL::Bounded_side result = side(CgalPoint(
-                query_points(row, 0), query_points(row, 1), query_points(row, 2)
-            ));
-            if (result == CGAL::ON_BOUNDARY) {
-                boundary_count++;
-            }
-            results[i] = result;
-        }
-        const auto query_end = std::chrono::steady_clock::now();
-        query_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(query_end - query_start);
-    };
-
-    std::vector<CGAL::Bounded_side> original_cgal_results(num_tests, CGAL::ON_UNBOUNDED_SIDE);
-    std::vector<CGAL::Bounded_side> cgal_results(num_tests, CGAL::ON_UNBOUNDED_SIDE);
-    std::size_t original_cgal_boundary_count = 0;
-    std::size_t cgal_boundary_count = 0;
-    std::size_t original_cgal_skipped_faces = 0;
-    std::size_t cgal_skipped_faces = 0;
-    std::chrono::nanoseconds original_cgal_build_ns(0);
-    std::chrono::nanoseconds original_cgal_query_ns(0);
-    std::chrono::nanoseconds cgal_build_ns(0);
-    std::chrono::nanoseconds cgal_query_ns(0);
-
-    run_cgal_queries(
-        reference_vertices,
-        reference_faces,
-        original_cgal_results,
-        original_cgal_boundary_count,
-        original_cgal_skipped_faces,
-        original_cgal_build_ns,
-        original_cgal_query_ns
-    );
-    if (original_cgal_skipped_faces > 0) {
-        std::cerr << "Warning: original CGAL skipped " << original_cgal_skipped_faces
-                  << " non-manifold or duplicate faces while building Surface_mesh." << std::endl;
-    }
-    run_cgal_queries(
-        reconstructed_vertices,
-        reconstructed_faces,
-        cgal_results,
-        cgal_boundary_count,
-        cgal_skipped_faces,
-        cgal_build_ns,
-        cgal_query_ns
-    );
-    if (cgal_skipped_faces > 0) {
-        std::cerr << "Warning: reconstructed CGAL skipped " << cgal_skipped_faces
-                  << " non-manifold or duplicate faces while building Surface_mesh." << std::endl;
-    }
+    const auto cgal_build_start = std::chrono::steady_clock::now();
 
     CgalMesh cgal_mesh;
     std::vector<CgalMesh::Vertex_index> cgal_vertices;
@@ -2257,368 +2171,256 @@ bool Inout::benchmark_mesh_inside_outside(
             reconstructed_vertices(i, 2)
         )));
     }
-    std::size_t seed_check_cgal_skipped_faces = 0;
+
+    std::size_t cgal_skipped_faces = 0;
     for (Eigen::Index i = 0; i < reconstructed_faces.rows(); ++i) {
+        const int i0 = reconstructed_faces(i, 0);
+        const int i1 = reconstructed_faces(i, 1);
+        const int i2 = reconstructed_faces(i, 2);
+        if (i0 < 0 || i1 < 0 || i2 < 0 ||
+            i0 >= reconstructed_vertices.rows() ||
+            i1 >= reconstructed_vertices.rows() ||
+            i2 >= reconstructed_vertices.rows()) {
+            cgal_skipped_faces++;
+            continue;
+        }
+
         const CgalMesh::Face_index face = cgal_mesh.add_face(
-            cgal_vertices[static_cast<std::size_t>(reconstructed_faces(i, 0))],
-            cgal_vertices[static_cast<std::size_t>(reconstructed_faces(i, 1))],
-            cgal_vertices[static_cast<std::size_t>(reconstructed_faces(i, 2))]
+            cgal_vertices[static_cast<std::size_t>(i0)],
+            cgal_vertices[static_cast<std::size_t>(i1)],
+            cgal_vertices[static_cast<std::size_t>(i2)]
         );
         if (face == CgalMesh::null_face()) {
-            seed_check_cgal_skipped_faces++;
+            cgal_skipped_faces++;
         }
     }
-    if (seed_check_cgal_skipped_faces > 0) {
-        std::cerr << "Warning: seed-check CGAL skipped " << seed_check_cgal_skipped_faces
-                  << " non-manifold or duplicate faces while building Surface_mesh." << std::endl;
+
+    if (cgal_skipped_faces > 0) {
+        std::cerr << "Warning: reconstructed CGAL skipped " << cgal_skipped_faces
+                  << " non-manifold / duplicate / invalid faces." << std::endl;
     }
 
-    const auto cgal_build_start = std::chrono::steady_clock::now();
     CgalTree cgal_tree(faces(cgal_mesh).first, faces(cgal_mesh).second, cgal_mesh);
     cgal_tree.build();
     CgalSide cgal_side(cgal_tree);
+
     const auto cgal_build_end = std::chrono::steady_clock::now();
-    const auto seed_check_cgal_build_ns =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(cgal_build_end - cgal_build_start);
-    (void)seed_check_cgal_build_ns;
+    const auto cgal_build_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        cgal_build_end - cgal_build_start
+    );
 
-    {
-        // Sanity-check seed labels against reconstruction GT using CGAL.
-        // If this is ~50%, it's usually not a KD-tree/query bug; it means the CSV seed
-        // "inside/outside" semantics are inconsistent with the reconstructed mesh (often due
-        // to normal/winding issues at seed-generation time or swapped columns in the CSV).
-        std::size_t seed_effective = 0;
-        std::size_t seed_boundary = 0;
-        std::size_t seed_label_mismatches = 0;
-        std::size_t seed_gt_inside = 0;
-        std::size_t seed_gt_outside = 0;
-        for (const auto& s : seed_points) {
-            const CGAL::Bounded_side side = cgal_side(CgalPoint(s.x, s.y, s.z));
-            if (side == CGAL::ON_BOUNDARY) {
-                seed_boundary++;
-                continue;
-            }
-            const bool gt_inside = (side == CGAL::ON_BOUNDED_SIDE);
-            seed_effective++;
-            if (gt_inside) seed_gt_inside++; else seed_gt_outside++;
-            const bool label_inside = (s.region != 0);
-            if (label_inside != gt_inside) {
-                seed_label_mismatches++;
-            }
-        }
-        const double seed_label_accuracy = (seed_effective > 0)
-            ? (100.0 * (1.0 - static_cast<double>(seed_label_mismatches) / static_cast<double>(seed_effective)))
-            : 100.0;
-        std::cout << std::fixed << std::setprecision(6)
-                  << "[Seed Label Check]"
-                  << " seeds=" << seed_points.size()
-                  << ", effective=" << seed_effective
-                  << ", boundary=" << seed_boundary
-                  << ", gt_inside=" << seed_gt_inside
-                  << ", gt_outside=" << seed_gt_outside
-                  << ", label_mismatches=" << seed_label_mismatches
-                  << ", label_accuracy=" << seed_label_accuracy << "%"
-                  << std::endl;
-    }
+    std::vector<unsigned char> cgal_inside(num_tests, 0);
+    std::vector<unsigned char> cgal_valid(num_tests, 0);
+    std::size_t cgal_boundary_count = 0;
+    std::size_t cgal_bbox_rejected = 0;
 
-    std::vector<unsigned char> method_inside(num_tests, 0);
-    std::vector<std::size_t> method_nearest_seed(num_tests, 0);
-    const auto method_query_start = std::chrono::steady_clock::now();
+    const auto cgal_query_start = std::chrono::steady_clock::now();
     for (std::size_t i = 0; i < num_tests; ++i) {
         const double qx = query_x[i];
         const double qy = query_y[i];
         const double qz = query_z[i];
-        unsigned char nearest_region = 0;
-        const std::size_t nearest_seed =
-            seed_index.nearest_index_and_region(qx, qy, qz, nearest_region);
-        if (nearest_seed >= seed_points.size()) {
-            std::cerr << "Error: nearest-seed query failed at test " << i << std::endl;
-            return false;
+
+        if (point_outside_bbox(
+                Eigen::Vector3d(qx, qy, qz),
+                reconstructed_bbox.min_x,
+                reconstructed_bbox.min_y,
+                reconstructed_bbox.min_z,
+                reconstructed_bbox.max_x,
+                reconstructed_bbox.max_y,
+                reconstructed_bbox.max_z
+            )) {
+            cgal_inside[i] = 0;
+            cgal_valid[i] = 1;
+            cgal_bbox_rejected++;
+            continue;
         }
-        method_nearest_seed[i] = nearest_seed;
-        method_inside[i] = nearest_region;
+
+        const CGAL::Bounded_side side = cgal_side(CgalPoint(qx, qy, qz));
+        if (side == CGAL::ON_BOUNDARY) {
+            cgal_valid[i] = 0;
+            cgal_boundary_count++;
+            continue;
+        }
+        cgal_inside[i] = static_cast<unsigned char>(side == CGAL::ON_BOUNDED_SIDE);
+        cgal_valid[i] = 1;
     }
-    const auto method_query_end = std::chrono::steady_clock::now();
-    const auto method_query_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-        method_query_end - method_query_start
+    const auto cgal_query_end = std::chrono::steady_clock::now();
+    const auto cgal_query_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        cgal_query_end - cgal_query_start
     );
 
-    std::vector<unsigned char> original_embree_inside(num_tests, 0);
+    // ============================================================
+    // 7. Embree parity baseline on reconstructed mesh, if enabled
+    // ============================================================
+    bool embree_available = false;
     std::vector<unsigned char> embree_inside(num_tests, 0);
-    std::chrono::nanoseconds original_embree_build_ns(0);
-    std::chrono::nanoseconds original_embree_query_ns(0);
     std::chrono::nanoseconds embree_build_ns(0);
     std::chrono::nanoseconds embree_query_ns(0);
-    bool original_embree_available = false;
-    bool embree_available = false;
+    std::size_t embree_bbox_rejected = 0;
+
 #ifdef USE_EMBREE
-    const auto run_embree_queries = [&](const Eigen::MatrixXd& vertices,
-                                        const Eigen::MatrixXi& faces,
-                                        std::vector<unsigned char>& inside,
-                                        std::chrono::nanoseconds& build_ns,
-                                        std::chrono::nanoseconds& query_ns,
-                                        bool& available,
-                                        const char* label) {
-        try {
-            const auto embree_build_start = std::chrono::steady_clock::now();
-            EmbreeParityTester embree_tester(vertices, faces);
-            const auto embree_build_end = std::chrono::steady_clock::now();
-            build_ns =
-                std::chrono::duration_cast<std::chrono::nanoseconds>(embree_build_end - embree_build_start);
-            available = true;
+    try {
+        const auto embree_build_start = std::chrono::steady_clock::now();
+        EmbreeParityTester embree_tester(reconstructed_vertices, reconstructed_faces);
+        const auto embree_build_end = std::chrono::steady_clock::now();
+        embree_build_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            embree_build_end - embree_build_start
+        );
+        embree_available = true;
 
-            const auto embree_query_start = std::chrono::steady_clock::now();
-            for (std::size_t i = 0; i < num_tests; ++i) {
-                const Eigen::Index row = static_cast<Eigen::Index>(i);
-                inside[i] = static_cast<unsigned char>(embree_tester.inside(
-                    query_points(row, 0),
-                    query_points(row, 1),
-                    query_points(row, 2)
-                ));
+        const auto embree_query_start = std::chrono::steady_clock::now();
+        for (std::size_t i = 0; i < num_tests; ++i) {
+            const double qx = query_x[i];
+            const double qy = query_y[i];
+            const double qz = query_z[i];
+
+            if (point_outside_bbox(
+                    Eigen::Vector3d(qx, qy, qz),
+                    reconstructed_bbox.min_x,
+                    reconstructed_bbox.min_y,
+                    reconstructed_bbox.min_z,
+                    reconstructed_bbox.max_x,
+                    reconstructed_bbox.max_y,
+                    reconstructed_bbox.max_z
+                )) {
+                embree_inside[i] = 0;
+                embree_bbox_rejected++;
+                continue;
             }
-            const auto embree_query_end = std::chrono::steady_clock::now();
-            query_ns =
-                std::chrono::duration_cast<std::chrono::nanoseconds>(embree_query_end - embree_query_start);
-        } catch (const std::exception& exc) {
-            std::cerr << "Warning: " << label
-                      << " Embree inside/outside test unavailable: " << exc.what() << std::endl;
-            available = false;
-        }
-    };
 
-    run_embree_queries(
-        reference_vertices,
-        reference_faces,
-        original_embree_inside,
-        original_embree_build_ns,
-        original_embree_query_ns,
-        original_embree_available,
-        "original"
-    );
-    run_embree_queries(
-        reconstructed_vertices,
-        reconstructed_faces,
-        embree_inside,
-        embree_build_ns,
-        embree_query_ns,
-        embree_available,
-        "reconstructed"
-    );
+            embree_inside[i] = static_cast<unsigned char>(embree_tester.inside(qx, qy, qz));
+        }
+        const auto embree_query_end = std::chrono::steady_clock::now();
+        embree_query_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            embree_query_end - embree_query_start
+        );
+    } catch (const std::exception& e) {
+        std::cerr << "Warning: Embree benchmark failed: " << e.what() << std::endl;
+        embree_available = false;
+        embree_build_ns = std::chrono::nanoseconds(0);
+        embree_query_ns = std::chrono::nanoseconds(0);
+    }
 #else
-    std::cerr << "Warning: Embree inside/outside test unavailable because USE_EMBREE is OFF." << std::endl;
+    std::cerr << "Warning: USE_EMBREE is OFF; Embree baseline is skipped." << std::endl;
 #endif
 
+    // ============================================================
+    // 8. Compare methods against CGAL reconstruction GT
+    // ============================================================
     struct MethodStats {
         std::size_t effective = 0;
         std::size_t gt_boundary = 0;
         std::size_t mismatches = 0;
+        std::size_t pred_inside = 0;
+        std::size_t pred_outside = 0;
         double accuracy = 100.0;
     };
 
-    struct MethodMismatch {
-        double qx = 0.0;
-        double qy = 0.0;
-        double qz = 0.0;
-        double sx = 0.0;
-        double sy = 0.0;
-        double sz = 0.0;
-        std::size_t seed_index = 0;
-        bool predicted_inside = false;
-        bool seed_inside = false;
-        bool gt_inside = false;
-    };
-
-    const auto write_method_mismatches_obj =
-        [&](const std::filesystem::path& out_path, const std::vector<MethodMismatch>& mismatches) {
-            std::error_code ec;
-            std::filesystem::create_directories(out_path.parent_path(), ec);
-            std::ofstream out(out_path);
-            if (!out.is_open()) {
-                std::cerr << "Warning: cannot write mismatch obj: " << out_path << std::endl;
-                return;
-            }
-            out << std::fixed << std::setprecision(16);
-            out << "# method mismatches (query point -> nearest seed)\n";
-            out << "# mismatches=" << mismatches.size() << "\n";
-            // Two vertices per mismatch: query then seed. We also output a line segment.
-            for (std::size_t i = 0; i < mismatches.size(); ++i) {
-                const MethodMismatch& m = mismatches[i];
-                out << "# i=" << i
-                    << " seed_index=" << m.seed_index
-                    << " predicted_inside=" << (m.predicted_inside ? 1 : 0)
-                    << " seed_inside=" << (m.seed_inside ? 1 : 0)
-                    << " gt_inside=" << (m.gt_inside ? 1 : 0)
-                    << "\n";
-                out << "v " << m.qx << " " << m.qy << " " << m.qz << "\n";
-                out << "v " << m.sx << " " << m.sy << " " << m.sz << "\n";
-            }
-            for (std::size_t i = 0; i < mismatches.size(); ++i) {
-                const std::size_t v0 = 2 * i + 1;
-                const std::size_t v1 = 2 * i + 2;
-                out << "l " << v0 << " " << v1 << "\n";
-            }
-        };
-
-    const auto accuracy_percent = [](std::size_t mismatches, std::size_t count) {
-        if (count == 0) return 100.0;
-        return 100.0 * (1.0 - static_cast<double>(mismatches) / static_cast<double>(count));
-    };
-
-    const auto compare_binary_to_cgal_gt = [&](const std::vector<unsigned char>& predicted_inside,
-                                               const std::vector<CGAL::Bounded_side>& gt_results,
-                                               std::vector<MethodMismatch>* method_mismatches_out) {
+    const auto compare_to_cgal_gt = [&](const std::vector<unsigned char>& predicted) {
         MethodStats stats;
         for (std::size_t i = 0; i < num_tests; ++i) {
-            if (gt_results[i] == CGAL::ON_BOUNDARY) {
+            if (!cgal_valid[i]) {
                 stats.gt_boundary++;
                 continue;
             }
-
-            const bool gt_inside = (gt_results[i] == CGAL::ON_BOUNDED_SIDE);
             stats.effective++;
-            const bool predicted = predicted_inside[i] != 0;
-            if (predicted != gt_inside) {
+            if (predicted[i]) {
+                stats.pred_inside++;
+            } else {
+                stats.pred_outside++;
+            }
+            if (predicted[i] != cgal_inside[i]) {
                 stats.mismatches++;
-                if (method_mismatches_out) {
-                    const std::size_t seed_idx = method_nearest_seed[i];
-                    const SeedPoint& seed = seed_points[seed_idx];
-                    const Eigen::Index row = static_cast<Eigen::Index>(i);
-                    method_mismatches_out->push_back(MethodMismatch{
-                        query_points(row, 0), query_points(row, 1), query_points(row, 2),
-                        seed.x, seed.y, seed.z,
-                        seed_idx,
-                        predicted,
-                        (seed.region != 0),
-                        gt_inside
-                    });
-                }
             }
         }
-        stats.accuracy = accuracy_percent(stats.mismatches, stats.effective);
+        stats.accuracy = stats.effective > 0
+            ? 100.0 * (1.0 - static_cast<double>(stats.mismatches) / static_cast<double>(stats.effective))
+            : 100.0;
         return stats;
     };
 
-    const auto compare_winding_to_cgal_gt = [&](const Eigen::VectorXd& winding_numbers,
-                                                const std::vector<CGAL::Bounded_side>& gt_results) {
-        std::vector<unsigned char> predicted_inside(num_tests, 0);
-        for (std::size_t i = 0; i < num_tests; ++i) {
-            predicted_inside[i] =
-                static_cast<unsigned char>(std::abs(winding_numbers(static_cast<Eigen::Index>(i))) > 0.5);
+    const MethodStats ours_stats = compare_to_cgal_gt(ours_inside);
+    const MethodStats fwn_stats = compare_to_cgal_gt(fwn_inside);
+    const MethodStats embree_stats = embree_available ? compare_to_cgal_gt(embree_inside) : MethodStats{};
+
+    std::size_t cgal_gt_inside = 0;
+    std::size_t cgal_gt_outside = 0;
+    for (std::size_t i = 0; i < num_tests; ++i) {
+        if (!cgal_valid[i]) continue;
+        if (cgal_inside[i]) {
+            cgal_gt_inside++;
+        } else {
+            cgal_gt_outside++;
         }
-        return compare_binary_to_cgal_gt(predicted_inside, gt_results, nullptr);
-    };
-
-    const MethodStats original_ours_stats =
-        compare_binary_to_cgal_gt(method_inside, original_cgal_results, nullptr);
-    const MethodStats reconstructed_ours_stats =
-        compare_binary_to_cgal_gt(method_inside, cgal_results, nullptr);
-    const MethodStats original_fast_winding_stats =
-        compare_winding_to_cgal_gt(original_fast_winding_numbers, original_cgal_results);
-    const MethodStats reconstructed_fast_winding_stats =
-        compare_winding_to_cgal_gt(reconstructed_fast_winding_numbers, cgal_results);
-    const MethodStats original_embree_stats = original_embree_available
-        ? compare_binary_to_cgal_gt(original_embree_inside, original_cgal_results, nullptr)
-        : MethodStats{};
-    const MethodStats embree_stats = embree_available
-        ? compare_binary_to_cgal_gt(embree_inside, cgal_results, nullptr)
-        : MethodStats{};
-
-    std::vector<MethodMismatch> reconstructed_method_mismatches;
-    reconstructed_method_mismatches.reserve(1024);
-    (void)compare_binary_to_cgal_gt(method_inside, cgal_results, &reconstructed_method_mismatches);
-
-    if (!reconstructed_method_mismatches.empty()) {
-        const std::filesystem::path reconstructed_path(reconstructed_mesh_obj);
-        const std::string stem = reconstructed_path.stem().string();
-        const std::filesystem::path out_obj =
-            std::filesystem::path("inout") / "results" / (stem + "_reconstructed_gt_method_mismatches.obj");
-        write_method_mismatches_obj(out_obj, reconstructed_method_mismatches);
-        std::cout << "[Reconstructed GT] wrote method mismatch OBJ: " << out_obj
-                  << " (count=" << reconstructed_method_mismatches.size() << ")" << std::endl;
-    } else {
-        std::cout << "[Reconstructed GT] no method mismatches; no mismatch OBJ written." << std::endl;
     }
 
     const auto ns_to_ms = [](std::chrono::nanoseconds ns) {
         return std::chrono::duration<double, std::milli>(ns).count();
     };
-    const auto ns_to_avg_us = [](std::chrono::nanoseconds ns, std::size_t count) {
-        if (count == 0) return 0.0;
-        return std::chrono::duration<double, std::micro>(ns).count() / static_cast<double>(count);
+    const auto ns_to_avg_us = [](std::chrono::nanoseconds ns, std::size_t n) {
+        return n > 0
+            ? std::chrono::duration<double, std::micro>(ns).count() / static_cast<double>(n)
+            : 0.0;
     };
 
-    const double original_fast_winding_total_ms = ns_to_ms(original_fast_winding_ns);
-    const double original_fast_winding_avg_us = ns_to_avg_us(original_fast_winding_ns, num_tests);
-    const double reconstructed_fast_winding_total_ms = ns_to_ms(reconstructed_fast_winding_ns);
-    const double reconstructed_fast_winding_avg_us =
-        ns_to_avg_us(reconstructed_fast_winding_ns, num_tests);
-    const double reconstructed_ours_build_ms = ns_to_ms(method_build_ns);
-    const double reconstructed_ours_query_total_ms = ns_to_ms(method_query_ns);
-    const double reconstructed_ours_query_avg_us = ns_to_avg_us(method_query_ns, num_tests);
-    const double original_cgal_build_ms = ns_to_ms(original_cgal_build_ns);
-    const double original_cgal_query_total_ms = ns_to_ms(original_cgal_query_ns);
-    const double original_cgal_query_avg_us = ns_to_avg_us(original_cgal_query_ns, num_tests);
-    const double reconstructed_cgal_build_ms = ns_to_ms(cgal_build_ns);
-    const double reconstructed_cgal_query_total_ms = ns_to_ms(cgal_query_ns);
-    const double reconstructed_cgal_query_avg_us = ns_to_avg_us(cgal_query_ns, num_tests);
-    const double original_embree_build_ms = ns_to_ms(original_embree_build_ns);
-    const double original_embree_query_total_ms = ns_to_ms(original_embree_query_ns);
-    const double original_embree_query_avg_us = ns_to_avg_us(original_embree_query_ns, num_tests);
-    const double reconstructed_embree_build_ms = ns_to_ms(embree_build_ns);
-    const double reconstructed_embree_query_total_ms = ns_to_ms(embree_query_ns);
-    const double reconstructed_embree_query_avg_us = ns_to_avg_us(embree_query_ns, num_tests);
+    const double ours_build_ms = ns_to_ms(ours_build_ns);
+    const double ours_query_total_ms = ns_to_ms(ours_query_ns);
+    const double ours_query_avg_us = ns_to_avg_us(ours_query_ns, num_tests);
+
+    const double fwn_total_ms = ns_to_ms(fwn_ns);
+    const double fwn_avg_us = ns_to_avg_us(fwn_ns, num_tests);
+
+    const double cgal_build_ms = ns_to_ms(cgal_build_ns);
+    const double cgal_query_total_ms = ns_to_ms(cgal_query_ns);
+    const double cgal_query_avg_us = ns_to_avg_us(cgal_query_ns, num_tests);
+
+    const double embree_build_ms = ns_to_ms(embree_build_ns);
+    const double embree_query_total_ms = ns_to_ms(embree_query_ns);
+    const double embree_query_avg_us = ns_to_avg_us(embree_query_ns, num_tests);
 
     std::cout << std::fixed << std::setprecision(6)
               << "[InOut Summary]"
               << " total_tests=" << num_tests
               << ", gt=cgal_reconstructed_mesh"
-              << ", original_fast_winding_total_ms=" << original_fast_winding_total_ms
-              << ", original_fast_winding_avg_us=" << original_fast_winding_avg_us
-              << ", reconstructed_fast_winding_total_ms=" << reconstructed_fast_winding_total_ms
-              << ", reconstructed_fast_winding_avg_us=" << reconstructed_fast_winding_avg_us
-              << ", reconstructed_ours_seed_tree_build_ms=" << reconstructed_ours_build_ms
-              << ", reconstructed_ours_query_total_ms=" << reconstructed_ours_query_total_ms
-              << ", reconstructed_ours_query_avg_us=" << reconstructed_ours_query_avg_us
-              << ", original_cgal_build_ms=" << original_cgal_build_ms
-              << ", original_cgal_query_total_ms=" << original_cgal_query_total_ms
-              << ", original_cgal_query_avg_us=" << original_cgal_query_avg_us
-              << ", reconstructed_cgal_build_ms=" << reconstructed_cgal_build_ms
-              << ", reconstructed_cgal_query_total_ms=" << reconstructed_cgal_query_total_ms
-              << ", reconstructed_cgal_query_avg_us=" << reconstructed_cgal_query_avg_us
-              << ", original_cgal_boundary_queries=" << original_cgal_boundary_count
-              << ", reconstructed_cgal_boundary_queries=" << cgal_boundary_count
-              << ", original_embree_available=" << (original_embree_available ? 1 : 0)
-              << ", original_embree_build_ms=" << original_embree_build_ms
-              << ", original_embree_query_total_ms=" << original_embree_query_total_ms
-              << ", original_embree_query_avg_us=" << original_embree_query_avg_us
-              << ", reconstructed_embree_available=" << (embree_available ? 1 : 0)
-              << ", reconstructed_embree_build_ms=" << reconstructed_embree_build_ms
-              << ", reconstructed_embree_query_total_ms=" << reconstructed_embree_query_total_ms
-              << ", reconstructed_embree_query_avg_us=" << reconstructed_embree_query_avg_us
+              << ", gt_effective=" << ours_stats.effective
+              << ", gt_boundary_skipped=" << cgal_boundary_count
+              << ", gt_inside=" << cgal_gt_inside
+              << ", gt_outside=" << cgal_gt_outside
+              << ", cgal_bbox_rejected=" << cgal_bbox_rejected
+              << ", cgal_skipped_faces=" << cgal_skipped_faces
+              << ", ours_seed_tree_build_ms=" << ours_build_ms
+              << ", ours_query_total_ms=" << ours_query_total_ms
+              << ", ours_query_avg_us=" << ours_query_avg_us
+              << ", fwn_total_ms=" << fwn_total_ms
+              << ", fwn_avg_us=" << fwn_avg_us
+              << ", fwn_boundary_like=" << fwn_boundary_like
+              << ", cgal_build_ms=" << cgal_build_ms
+              << ", cgal_query_total_ms=" << cgal_query_total_ms
+              << ", cgal_query_avg_us=" << cgal_query_avg_us
+              << ", embree_available=" << (embree_available ? 1 : 0)
+              << ", embree_bbox_rejected=" << embree_bbox_rejected
+              << ", embree_build_ms=" << embree_build_ms
+              << ", embree_query_total_ms=" << embree_query_total_ms
+              << ", embree_query_avg_us=" << embree_query_avg_us
               << std::endl;
 
     std::cout << std::fixed << std::setprecision(6)
               << "[CGAL GT Accuracy]"
-              << " original_effective_tests=" << original_ours_stats.effective
-              << ", original_gt_boundary_skipped=" << original_ours_stats.gt_boundary
-              << ", original_ours_mismatches=" << original_ours_stats.mismatches
-              << ", original_ours_accuracy=" << original_ours_stats.accuracy << "%"
-              << ", reconstructed_effective_tests=" << reconstructed_ours_stats.effective
-              << ", reconstructed_gt_boundary_skipped=" << reconstructed_ours_stats.gt_boundary
-              << ", reconstructed_ours_mismatches=" << reconstructed_ours_stats.mismatches
-              << ", reconstructed_ours_accuracy=" << reconstructed_ours_stats.accuracy << "%"
-              << ", original_fast_winding_effective_tests=" << original_fast_winding_stats.effective
-              << ", original_fast_winding_boundary_skipped=" << original_fast_winding_stats.gt_boundary
-              << ", original_fast_winding_mismatches=" << original_fast_winding_stats.mismatches
-              << ", original_fast_winding_accuracy=" << original_fast_winding_stats.accuracy << "%"
-              << ", reconstructed_fast_winding_effective_tests=" << reconstructed_fast_winding_stats.effective
-              << ", reconstructed_fast_winding_boundary_skipped=" << reconstructed_fast_winding_stats.gt_boundary
-              << ", reconstructed_fast_winding_mismatches=" << reconstructed_fast_winding_stats.mismatches
-              << ", reconstructed_fast_winding_accuracy=" << reconstructed_fast_winding_stats.accuracy << "%"
-              << ", original_embree_mismatches=" << original_embree_stats.mismatches
-              << ", original_embree_accuracy=" << original_embree_stats.accuracy << "%"
+              << " ours_effective=" << ours_stats.effective
+              << ", ours_mismatches=" << ours_stats.mismatches
+              << ", ours_accuracy=" << ours_stats.accuracy << "%"
+              << ", ours_pred_inside=" << ours_stats.pred_inside
+              << ", ours_pred_outside=" << ours_stats.pred_outside
+              << ", fwn_effective=" << fwn_stats.effective
+              << ", fwn_mismatches=" << fwn_stats.mismatches
+              << ", fwn_accuracy=" << fwn_stats.accuracy << "%"
+              << ", fwn_pred_inside=" << fwn_stats.pred_inside
+              << ", fwn_pred_outside=" << fwn_stats.pred_outside
+              << ", embree_effective=" << embree_stats.effective
               << ", embree_mismatches=" << embree_stats.mismatches
               << ", embree_accuracy=" << embree_stats.accuracy << "%"
+              << ", embree_pred_inside=" << embree_stats.pred_inside
+              << ", embree_pred_outside=" << embree_stats.pred_outside
               << std::endl;
 
     if (!csv_output.empty()) {
@@ -2628,80 +2430,64 @@ bool Inout::benchmark_mesh_inside_outside(
             std::cerr << "Error: cannot write csv output: " << csv_output << std::endl;
             return false;
         }
+
         if (!exists) {
-            out << "reconstructed,reference,seed_pair_csv,seeds,total_tests,"
-                << "gt_method,"
-                << "original_fast_winding_total_ms,original_fast_winding_avg_us,"
-                << "reconstructed_fast_winding_total_ms,reconstructed_fast_winding_avg_us,"
-                << "reconstructed_ours_seed_tree_build_ms,reconstructed_ours_query_total_ms,reconstructed_ours_query_avg_us,"
-                << "original_cgal_build_ms,original_cgal_query_total_ms,original_cgal_query_avg_us,original_cgal_boundary_queries,"
-                << "reconstructed_cgal_build_ms,reconstructed_cgal_query_total_ms,reconstructed_cgal_query_avg_us,reconstructed_cgal_boundary_queries,"
-                << "original_embree_available,original_embree_build_ms,original_embree_query_total_ms,original_embree_query_avg_us,"
-                << "reconstructed_embree_available,reconstructed_embree_build_ms,reconstructed_embree_query_total_ms,reconstructed_embree_query_avg_us,"
-                << "original_effective_tests,original_gt_boundary_skipped,"
-                << "original_ours_mismatches,original_ours_accuracy_percent,"
-                << "reconstructed_effective_tests,reconstructed_gt_boundary_skipped,"
-                << "reconstructed_ours_mismatches,reconstructed_ours_accuracy_percent,"
-                << "original_fast_winding_effective_tests,original_fast_winding_boundary_skipped,"
-                << "original_fast_winding_mismatches,original_fast_winding_accuracy_percent,"
-                << "reconstructed_fast_winding_effective_tests,reconstructed_fast_winding_boundary_skipped,"
-                << "reconstructed_fast_winding_mismatches,reconstructed_fast_winding_accuracy_percent,"
-                << "original_embree_mismatches,original_embree_accuracy_percent,"
-                << "embree_mismatches,embree_accuracy_percent\n";
+            out << "reconstructed,seed_pair_csv,seeds,total_tests,gt_method,"
+                << "gt_effective,gt_boundary_skipped,gt_inside,gt_outside,"
+                << "cgal_bbox_rejected,cgal_skipped_faces,"
+                << "ours_seed_tree_build_ms,ours_query_total_ms,ours_query_avg_us,"
+                << "fwn_total_ms,fwn_avg_us,fwn_boundary_like,"
+                << "cgal_build_ms,cgal_query_total_ms,cgal_query_avg_us,"
+                << "embree_available,embree_bbox_rejected,embree_build_ms,embree_query_total_ms,embree_query_avg_us,"
+                << "ours_mismatches,ours_accuracy_percent,ours_pred_inside,ours_pred_outside,"
+                << "fwn_mismatches,fwn_accuracy_percent,fwn_pred_inside,fwn_pred_outside,"
+                << "embree_mismatches,embree_accuracy_percent,embree_pred_inside,embree_pred_outside,"
+                << "ours_index_checksum,ours_dist2_checksum\n";
         }
+
         out << std::fixed << std::setprecision(9)
             << reconstructed_mesh_obj << ','
-            << reference_mesh_obj << ','
             << seed_pair_csv << ','
             << seed_points.size() << ','
             << num_tests << ','
             << "cgal_reconstructed_mesh" << ','
-            << original_fast_winding_total_ms << ','
-            << original_fast_winding_avg_us << ','
-            << reconstructed_fast_winding_total_ms << ','
-            << reconstructed_fast_winding_avg_us << ','
-            << reconstructed_ours_build_ms << ','
-            << reconstructed_ours_query_total_ms << ','
-            << reconstructed_ours_query_avg_us << ','
-            << original_cgal_build_ms << ','
-            << original_cgal_query_total_ms << ','
-            << original_cgal_query_avg_us << ','
-            << original_cgal_boundary_count << ','
-            << reconstructed_cgal_build_ms << ','
-            << reconstructed_cgal_query_total_ms << ','
-            << reconstructed_cgal_query_avg_us << ','
+            << ours_stats.effective << ','
             << cgal_boundary_count << ','
-            << (original_embree_available ? 1 : 0) << ','
-            << original_embree_build_ms << ','
-            << original_embree_query_total_ms << ','
-            << original_embree_query_avg_us << ','
+            << cgal_gt_inside << ','
+            << cgal_gt_outside << ','
+            << cgal_bbox_rejected << ','
+            << cgal_skipped_faces << ','
+            << ours_build_ms << ','
+            << ours_query_total_ms << ','
+            << ours_query_avg_us << ','
+            << fwn_total_ms << ','
+            << fwn_avg_us << ','
+            << fwn_boundary_like << ','
+            << cgal_build_ms << ','
+            << cgal_query_total_ms << ','
+            << cgal_query_avg_us << ','
             << (embree_available ? 1 : 0) << ','
-            << reconstructed_embree_build_ms << ','
-            << reconstructed_embree_query_total_ms << ','
-            << reconstructed_embree_query_avg_us << ','
-            << original_ours_stats.effective << ','
-            << original_ours_stats.gt_boundary << ','
-            << original_ours_stats.mismatches << ','
-            << original_ours_stats.accuracy << ','
-            << reconstructed_ours_stats.effective << ','
-            << reconstructed_ours_stats.gt_boundary << ','
-            << reconstructed_ours_stats.mismatches << ','
-            << reconstructed_ours_stats.accuracy << ','
-            << original_fast_winding_stats.effective << ','
-            << original_fast_winding_stats.gt_boundary << ','
-            << original_fast_winding_stats.mismatches << ','
-            << original_fast_winding_stats.accuracy << ','
-            << reconstructed_fast_winding_stats.effective << ','
-            << reconstructed_fast_winding_stats.gt_boundary << ','
-            << reconstructed_fast_winding_stats.mismatches << ','
-            << reconstructed_fast_winding_stats.accuracy << ','
-            << original_embree_stats.mismatches << ','
-            << original_embree_stats.accuracy << ','
+            << embree_bbox_rejected << ','
+            << embree_build_ms << ','
+            << embree_query_total_ms << ','
+            << embree_query_avg_us << ','
+            << ours_stats.mismatches << ','
+            << ours_stats.accuracy << ','
+            << ours_stats.pred_inside << ','
+            << ours_stats.pred_outside << ','
+            << fwn_stats.mismatches << ','
+            << fwn_stats.accuracy << ','
+            << fwn_stats.pred_inside << ','
+            << fwn_stats.pred_outside << ','
             << embree_stats.mismatches << ','
-            << embree_stats.accuracy << '\n';
+            << embree_stats.accuracy << ','
+            << embree_stats.pred_inside << ','
+            << embree_stats.pred_outside << ','
+            << ours_index_checksum << ','
+            << ours_dist2_checksum
+            << '\n';
     }
 
-    (void)saw_explicit_region;
     return true;
 #endif
 }
